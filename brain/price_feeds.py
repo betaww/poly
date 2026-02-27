@@ -11,6 +11,7 @@ faster than anyone else, using the RTX 5090.
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -44,9 +45,24 @@ class BinanceFeed:
     async def connect(self, callback, asset: str = "btc"):
         """Connect and stream price updates."""
         self._running = True
+        # SOCKS proxy for regions where Binance is blocked
+        proxy = os.environ.get("POLY_SOCKS_PROXY", "")
+        ws_kwargs = {}
+        if proxy:
+            try:
+                from python_socks.async_.asyncio import Proxy
+                p = Proxy.from_url(proxy)
+                sock = await p.connect("stream.binance.com", 9443)
+                ws_kwargs["sock"] = sock
+                logger.info(f"Binance using SOCKS proxy: {proxy}")
+            except ImportError:
+                logger.warning("python-socks not installed, connecting directly")
+            except Exception as e:
+                logger.warning(f"Proxy connection failed: {e}, trying direct")
+
         while self._running:
             try:
-                async with websockets.connect(self.url) as ws:
+                async with websockets.connect(self.url, **ws_kwargs) as ws:
                     logger.info(f"Binance WS connected: {self.symbol}")
                     async for msg in ws:
                         if not self._running:
