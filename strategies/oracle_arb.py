@@ -91,20 +91,27 @@ class OracleArbStrategy(BaseStrategy):
         distance = (self._cex_price - self._strike_price) / self._strike_price
         abs_distance = abs(distance)
 
+        # BUG FIX: exact match = too close to call, not "Down"
+        if abs_distance < 0.00001:  # < 0.001% — effectively at strike
+            return "Unknown", 0.50
+
         # Direction
         direction = "Up" if distance > 0 else "Down"
 
         # Confidence based on distance magnitude
-        # Larger distance = higher confidence
-        # Using empirical mapping from V7 backtests
+        # BUG FIX: ensure continuous confidence curve (no overflow)
+        # Ranges: [0.001, ∞) → 95-99%, [0.0005, 0.001) → 90-95%,
+        #         [0.0001, 0.0005) → 70-90%, [0, 0.0001) → 50-70%
         if abs_distance > 0.001:        # > 0.1% from strike
             confidence = 0.95 + min(abs_distance * 10, 0.04)  # 95-99%
         elif abs_distance > 0.0005:     # > 0.05%
-            confidence = 0.85 + abs_distance * 100             # 85-95%
+            # Linear: 0.0005 → 0.90, 0.001 → 0.95
+            confidence = 0.90 + (abs_distance - 0.0005) * 100  # 90-95%
         elif abs_distance > 0.0001:     # > 0.01%
-            confidence = 0.70 + abs_distance * 500             # 70-85%
-        else:                           # < 0.01% — too close to call
-            confidence = 0.50
+            # Linear: 0.0001 → 0.70, 0.0005 → 0.90
+            confidence = 0.70 + (abs_distance - 0.0001) * 500  # 70-90%
+        else:                           # < 0.01% — low confidence
+            confidence = 0.50 + abs_distance * 2000            # 50-70%
 
         return direction, min(confidence, 0.99)
 
@@ -175,18 +182,19 @@ class OracleArbStrategy(BaseStrategy):
             return []
 
         phase = self._get_phase(market)
+
+        # --- OBSERVATION: just build context, no tracking ---
+        if phase == Phase.OBSERVATION:
+            return []
+
         direction, confidence = self._predict_direction()
 
-        # Track direction changes
+        # Track direction changes (only in PREP/COMMIT to avoid unbounded list)
         if direction in ("Up", "Down"):
             if self._last_direction and direction != self._last_direction:
                 self._reversal_count += 1
             self._last_direction = direction
             self._direction_history.append(direction)
-
-        # --- OBSERVATION: just build context ---
-        if phase == Phase.OBSERVATION:
-            return []
 
         # --- PREPARATION: track but don't trade ---
         if phase == Phase.PREPARATION:
@@ -295,7 +303,16 @@ class OracleArbStrategy(BaseStrategy):
             self.state.daily_pnl_usd += pnl
             self.state.total_pnl_usd += pnl
 
+            # BUG FIX: Only increment rounds_traded for rounds we actually traded
+            self.state.rounds_traded += 1
+            self._logger.info(
+                f"Round end: {market.asset.upper()} | Outcome={settled_outcome} | "
+                f"PnL={self.state.daily_pnl_usd:+.2f}"
+            )
+        else:
+            # No trade this round — skip rounds_traded increment
+            # Don't call super() which would incorrectly inflate rounds_traded
+            pass
+
         # Reset strike for next round
         self._strike_price = 0.0
-
-        await super().on_round_end(market, settled_outcome)
