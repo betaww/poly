@@ -49,26 +49,20 @@ class BinanceFeed:
 
         while self._running:
             try:
-                # Create proxy socket fresh each attempt (consumed on use)
+                # Create proxy socket fresh each attempt
                 ws_kwargs = {}
                 if proxy_url:
                     try:
-                        import ssl
                         from python_socks.async_.asyncio import Proxy
                         p = Proxy.from_url(proxy_url)
                         sock = await p.connect(
                             dest_host="stream.binance.com",
                             dest_port=9443,
                         )
-                        # Wrap in SSL for wss://
-                        ssl_ctx = ssl.create_default_context()
-                        sock = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: ssl_ctx.wrap_socket(
-                                sock, server_hostname="stream.binance.com"
-                            )
-                        )
+                        # Pass raw socket; websockets handles TLS via wss:// URI
                         ws_kwargs["sock"] = sock
-                        logger.info(f"Binance proxy socket ready")
+                        ws_kwargs["server_hostname"] = "stream.binance.com"
+                        logger.info("Binance proxy socket ready")
                     except Exception as e:
                         logger.warning(f"Proxy failed: {e}, trying direct")
 
