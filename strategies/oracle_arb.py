@@ -156,12 +156,16 @@ class OracleArbStrategy(BaseStrategy):
         self._signal_sent_this_round = False
         self._round_cost = 0.0
 
-        # Infer strike price from market midpoint at round start
-        # In a fair market, midpoint ~0.50 means price is at the strike
-        # The actual strike is embedded in the market question but not exposed via API
-        # So we use the CEX price at round start as the reference strike
-        if self._cex_price > 0 and self._strike_price == 0:
+        # Use the strike price parsed from market question (e.g. "BTC above $84,500")
+        if market.strike_price > 0:
+            self._strike_price = market.strike_price
+            self._logger.info(
+                f"Round strike: ${self._strike_price:,.2f} | CEX: ${self._cex_price:,.2f}"
+            )
+        elif self._cex_price > 0:
+            # Fallback: use CEX price at round start (less accurate)
             self._strike_price = self._cex_price
+            self._logger.warning("Strike not parsed, using CEX price as fallback")
 
     async def on_market_update(self, market: MarketInfo) -> list[Signal]:
         """

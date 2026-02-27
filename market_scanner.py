@@ -5,6 +5,7 @@ Uses deterministic slug calculation: {asset}-updown-{tf}-{unix_timestamp}
 Verified working pattern: events?slug=btc-updown-5m-{ts}
 """
 import time
+import re
 import math
 import asyncio
 import logging
@@ -50,6 +51,9 @@ class MarketInfo:
     # Maker orders: 0% fee + rebate
     fee_rate: float = 0.25       # Polymarket feeRate parameter
     fee_exponent: int = 2        # Polymarket exponent parameter
+
+    # Strike price parsed from question (e.g. "BTC above $84,500.00" → 84500.0)
+    strike_price: float = 0.0
 
     @property
     def seconds_remaining(self) -> float:
@@ -102,6 +106,19 @@ class MarketScanner:
         prev_end = current_end - duration
 
         return [current_end, next_end]
+
+    @staticmethod
+    def _parse_strike(question: str) -> float:
+        """Parse strike price from market question text.
+        
+        Examples:
+          "Will BTC be above $84,500.00 at 2:30 PM?" → 84500.0
+          "Will ETH be above $2,250.50 at 3:00 PM?"  → 2250.5
+        """
+        match = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', question)
+        if match:
+            return float(match.group(1).replace(',', ''))
+        return 0.0
 
     def _make_slug(self, asset: str, window_end: int) -> str:
         """Build deterministic slug."""
@@ -191,6 +208,7 @@ class MarketScanner:
                 neg_risk=market.get("negRisk", False),
                 fee_rate=0.25,       # fixed for 5m/15m crypto
                 fee_exponent=2,      # fixed for 5m/15m crypto
+                strike_price=self._parse_strike(market.get("question", "")),
             )
 
         except Exception as e:
