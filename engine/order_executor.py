@@ -127,13 +127,14 @@ class OrderExecutor:
             )
         else:
             # Maker order: probabilistic fill, 0% fee
+            # In 5-min markets, GTC orders rest for ~60s on average
             result = self._simulator.simulate_gtc_order(
                 price=signal.price,
                 size_usd=signal.size_usd,
                 midpoint=midpoint,
                 is_buy=is_buy,
-                seconds_resting=1.0,  # ~1 update cycle
-                volatility=0.01,
+                seconds_resting=60.0,  # 5-min round, realistic resting time
+                volatility=0.05,       # crypto 5-min vol ~5%
             )
 
         if result.filled:

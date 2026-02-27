@@ -50,7 +50,8 @@ def print_report(stats: dict):
     if stats["daily"]:
         print("─── Daily ───")
         for d in stats["daily"]:
-            bar = "█" * max(1, int(abs(d["pnl"].replace("$", "").replace("+", "")) * 2))
+            pnl_val = float(d["pnl"].replace("$", "").replace("+", ""))
+            bar = "█" * max(1, int(abs(pnl_val) * 2))
             color = "+" if not d["pnl"].startswith("$-") else "-"
             print(f"  {d['date']}  Rounds={d['rounds']:3d}  "
                   f"Wins={d['wins']:3d}  P&L={d['pnl']:>8s}  {bar}")
