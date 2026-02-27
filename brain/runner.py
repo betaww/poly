@@ -1,53 +1,49 @@
 """
-Alienware Brain Runner — entry point for the GPU prediction node.
+Alienware Brain Runner — receives price feeds from VPS via Redis.
 
-Connects to exchange WebSockets, runs the Synthetic Oracle,
-and publishes predictions to Redis for VPS consumption.
+Architecture:
+  VPS: feed_forwarder.py → Redis pub/sub (polymarket:feeds)
+  Brain: Redis sub → SyntheticOracle → Redis pub (predictions)
+
+The Brain no longer connects to exchanges directly — the VPS handles all
+exchange WebSocket connections and forwards price ticks via Redis.
+This avoids network restriction issues on the Alienware side.
 
 Usage:
   python -m user_data.polymarket.brain.runner
 
 Env vars:
-  POLY_REDIS_HOST — Redis host (default: localhost / Tailscale IP)
+  POLY_REDIS_HOST — Redis host (default: localhost)
   POLY_REDIS_PORT — Redis port (default: 6379)
+  POLY_REDIS_PASSWORD — Redis password
 """
 import asyncio
 import json
 import logging
 import time
+import threading
 
 import redis
 
 from ..config import Config
-from .price_feeds import OKXFeed, CoinbaseFeed, SyntheticOracle, PriceTick
+from .price_feeds import SyntheticOracle, PriceTick
 
 logger = logging.getLogger(__name__)
 
 
 class BrainRunner:
     """
-    The Brain: receives CEX prices, predicts Chainlink settlement, publishes to Redis.
+    The Brain: receives CEX prices from VPS via Redis,
+    predicts Chainlink settlement, publishes predictions back to Redis.
     """
 
     def __init__(self, config: Config):
         self.config = config
-        self.oracle = SyntheticOracle(config)
-
-        # Price feeds — OKX replaces Binance (Binance blocked in some regions)
-        self._feeds = {
-            "okx_btc": OKXFeed("btcusdt"),
-            "coinbase_btc": CoinbaseFeed("BTC-USD"),
-        }
-        # Add ETH feeds if configured
-        if "eth" in config.market.assets:
-            self._feeds["okx_eth"] = OKXFeed("ethusdt")
-            self._feeds["coinbase_eth"] = CoinbaseFeed("ETH-USD")
-
-        # Redis publisher
         self._redis: redis.Redis | None = None
         self._publish_interval = 0.1  # 100ms — publish predictions at 10 Hz
         self._last_publish = 0.0
         self._running = False
+        self._tick_count = 0
 
         # Separate oracle per asset
         self._oracles: dict[str, SyntheticOracle] = {
@@ -71,22 +67,19 @@ class BrainRunner:
         self._redis.ping()
         logger.info(f"Redis connected: {rc.host}:{rc.port}")
 
-    async def _on_tick(self, tick: PriceTick):
-        """Handle price tick from any exchange."""
-        # Route to the correct per-asset oracle using tick.asset
+    def _on_tick(self, tick: PriceTick):
+        """Handle price tick from Redis subscription."""
         asset = tick.asset
-
-        # Update the appropriate oracle
         if asset in self._oracles:
             self._oracles[asset].update(tick)
 
-        # Publish at configured interval
-        now = time.time()
-        if now - self._last_publish >= self._publish_interval:
-            self._last_publish = now
-            await self._publish_predictions()
+        self._tick_count += 1
+        # Log every 100 ticks
+        if self._tick_count % 100 == 0:
+            sources = {a: len(o.prices) for a, o in self._oracles.items()}
+            logger.info(f"Ticks received: {self._tick_count} | Sources: {sources}")
 
-    async def _publish_predictions(self):
+    def _publish_predictions(self):
         """Publish current predictions to Redis."""
         if not self._redis:
             return
@@ -112,6 +105,43 @@ class BrainRunner:
             except Exception as e:
                 logger.error(f"Redis publish failed: {e}")
 
+    def _subscribe_feeds(self):
+        """Subscribe to VPS price feeds via Redis pub/sub (runs in a thread)."""
+        rc = self.config.redis
+        kwargs = {
+            "host": rc.host, "port": rc.port, "db": rc.db,
+            "decode_responses": True,
+        }
+        if rc.password:
+            kwargs["password"] = rc.password
+
+        sub_redis = redis.Redis(**kwargs)
+        pubsub = sub_redis.pubsub()
+        pubsub.subscribe("polymarket:feeds")
+        logger.info("Subscribed to polymarket:feeds")
+
+        for message in pubsub.listen():
+            if not self._running:
+                break
+            if message["type"] != "message":
+                continue
+            try:
+                d = json.loads(message["data"])
+                tick = PriceTick(
+                    exchange=d["exchange"],
+                    asset=d["asset"],
+                    price=d["price"],
+                    bid=d.get("bid", 0),
+                    ask=d.get("ask", 0),
+                    timestamp=d.get("ts", time.time()),
+                )
+                self._on_tick(tick)
+            except Exception as e:
+                logger.error(f"Feed parse error: {e}")
+
+        pubsub.close()
+        sub_redis.close()
+
     async def start(self):
         """Start the brain node."""
         self._running = True
@@ -120,37 +150,30 @@ class BrainRunner:
         logger.info(f"""
 ╔═══════════════════════════════════════════════════╗
 ║  Polymarket Brain Node (Alienware RTX 5090)       ║
+║  Mode: Redis subscriber (VPS feeds all exchanges) ║
 ║  Assets: {', '.join(a.upper() for a in self._oracles):<40s}║
-║  Feeds: {len(self._feeds):<41d}║
 ║  Publish rate: {1/self._publish_interval:.0f} Hz{' '*31}║
 ║  Redis: {f"{self.config.redis.host}:{self.config.redis.port}":<41s}║
 ╚═══════════════════════════════════════════════════╝
         """)
 
-        # Start all feeds concurrently, passing asset tag
-        tasks = []
-        asset_map = {
-            "binance_btc": "btc", "coinbase_btc": "btc",
-            "binance_eth": "eth", "coinbase_eth": "eth",
-        }
-        for name, feed in self._feeds.items():
-            asset = asset_map.get(name, "btc")
-            task = asyncio.create_task(feed.connect(self._on_tick, asset=asset))
-            tasks.append(task)
-            logger.info(f"Feed started: {name} → {asset}")
+        # Start Redis subscriber in a background thread
+        feed_thread = threading.Thread(target=self._subscribe_feeds, daemon=True)
+        feed_thread.start()
+        logger.info("Feed subscriber thread started")
 
+        # Main loop: publish predictions at configured rate
         try:
-            await asyncio.gather(*tasks)
+            while self._running:
+                self._publish_predictions()
+                await asyncio.sleep(self._publish_interval)
         except asyncio.CancelledError:
             logger.info("Brain shutting down...")
         finally:
-            for feed in self._feeds.values():
-                feed.stop()
+            self._running = False
 
     def stop(self):
         self._running = False
-        for feed in self._feeds.values():
-            feed.stop()
 
 
 def main():
