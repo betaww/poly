@@ -142,6 +142,64 @@ class CoinbaseFeed:
         self._running = False
 
 
+class OKXFeed:
+    """OKX WebSocket — replaces Binance for restricted regions (no HTTP 451)."""
+
+    # symbol map: btcusdt → BTC-USDT
+    SYMBOL_MAP = {
+        "btcusdt": "BTC-USDT",
+        "ethusdt": "ETH-USDT",
+    }
+
+    def __init__(self, symbol: str = "btcusdt"):
+        self.symbol = symbol
+        self.okx_symbol = self.SYMBOL_MAP.get(symbol, symbol.upper().replace("usdt", "-USDT"))
+        self.url = "wss://ws.okx.com:8443/ws/v5/public"
+        self.last_price: float = 0.0
+        self._running = False
+
+    async def connect(self, callback, asset: str = "btc"):
+        self._running = True
+        while self._running:
+            try:
+                async with websockets.connect(self.url) as ws:
+                    # Subscribe to ticker channel
+                    sub = {
+                        "op": "subscribe",
+                        "args": [{"channel": "tickers", "instId": self.okx_symbol}],
+                    }
+                    await ws.send(json.dumps(sub))
+                    logger.info(f"OKX WS connected: {self.okx_symbol}")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(msg)
+                        # OKX sends: {"arg":..., "data":[{"last":"84500",...}]}
+                        if "data" not in data:
+                            continue
+                        for item in data["data"]:
+                            tick = PriceTick(
+                                exchange="okx",
+                                asset=asset,
+                                price=float(item.get("last", 0)),
+                                bid=float(item.get("bidPx", 0)),
+                                ask=float(item.get("askPx", 0)),
+                                timestamp=time.time(),
+                            )
+                            self.last_price = tick.price
+                            await callback(tick)
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("OKX WS disconnected, reconnecting...")
+            except Exception as e:
+                logger.error(f"OKX WS error: {e}")
+            if self._running:
+                await asyncio.sleep(1)
+
+    def stop(self):
+        self._running = False
+
+
 class SyntheticOracle:
     """
     Weighted price aggregator that mimics Chainlink Data Streams.

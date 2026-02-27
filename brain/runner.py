@@ -19,7 +19,7 @@ import time
 import redis
 
 from ..config import Config
-from .price_feeds import BinanceFeed, CoinbaseFeed, SyntheticOracle, PriceTick
+from .price_feeds import OKXFeed, CoinbaseFeed, SyntheticOracle, PriceTick
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,14 @@ class BrainRunner:
         self.config = config
         self.oracle = SyntheticOracle(config)
 
-        # Price feeds
+        # Price feeds — OKX replaces Binance (Binance blocked in some regions)
         self._feeds = {
-            "binance_btc": BinanceFeed("btcusdt"),
+            "okx_btc": OKXFeed("btcusdt"),
             "coinbase_btc": CoinbaseFeed("BTC-USD"),
         }
         # Add ETH feeds if configured
         if "eth" in config.market.assets:
-            self._feeds["binance_eth"] = BinanceFeed("ethusdt")
+            self._feeds["okx_eth"] = OKXFeed("ethusdt")
             self._feeds["coinbase_eth"] = CoinbaseFeed("ETH-USD")
 
         # Redis publisher
