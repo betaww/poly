@@ -45,23 +45,33 @@ class BinanceFeed:
     async def connect(self, callback, asset: str = "btc"):
         """Connect and stream price updates."""
         self._running = True
-        # SOCKS proxy for regions where Binance is blocked
-        proxy = os.environ.get("POLY_SOCKS_PROXY", "")
-        ws_kwargs = {}
-        if proxy:
-            try:
-                from python_socks.async_.asyncio import Proxy
-                p = Proxy.from_url(proxy)
-                sock = await p.connect("stream.binance.com", 9443)
-                ws_kwargs["sock"] = sock
-                logger.info(f"Binance using SOCKS proxy: {proxy}")
-            except ImportError:
-                logger.warning("python-socks not installed, connecting directly")
-            except Exception as e:
-                logger.warning(f"Proxy connection failed: {e}, trying direct")
+        proxy_url = os.environ.get("POLY_SOCKS_PROXY", "")
 
         while self._running:
             try:
+                # Create proxy socket fresh each attempt (consumed on use)
+                ws_kwargs = {}
+                if proxy_url:
+                    try:
+                        import ssl
+                        from python_socks.async_.asyncio import Proxy
+                        p = Proxy.from_url(proxy_url)
+                        sock = await p.connect(
+                            dest_host="stream.binance.com",
+                            dest_port=9443,
+                        )
+                        # Wrap in SSL for wss://
+                        ssl_ctx = ssl.create_default_context()
+                        sock = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: ssl_ctx.wrap_socket(
+                                sock, server_hostname="stream.binance.com"
+                            )
+                        )
+                        ws_kwargs["sock"] = sock
+                        logger.info(f"Binance proxy socket ready")
+                    except Exception as e:
+                        logger.warning(f"Proxy failed: {e}, trying direct")
+
                 async with websockets.connect(self.url, **ws_kwargs) as ws:
                     logger.info(f"Binance WS connected: {self.symbol}")
                     async for msg in ws:
@@ -83,7 +93,7 @@ class BinanceFeed:
             except Exception as e:
                 logger.error(f"Binance WS error: {e}")
             if self._running:
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
     def stop(self):
         self._running = False
