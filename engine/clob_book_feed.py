@@ -192,7 +192,10 @@ class CLOBBookFeed:
                             }
                             await ws.send(json.dumps(sub_msg))
                             logger.info(f"Late-subscribed to book: {tid[:16]}...")
-                        self._process_message(json.loads(msg))
+                        try:
+                            self._process_message(json.loads(msg))
+                        except json.JSONDecodeError:
+                            pass  # ACK/ping frames are not JSON
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("CLOB WS disconnected, reconnecting in 2s...")
