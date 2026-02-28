@@ -245,7 +245,12 @@ def estimate_gtc_fill_probability(
     # Saturates at ~10 seconds
     time_factor = 1.0 - math.exp(-seconds_resting / 5.0)
 
-    probability = base_prob * time_factor * 0.85  # 85% cap (never 100% certain)
+    # P3 FIX: Queue competition — we're not the only maker.
+    # In real 5-min markets, 3-10 bots compete for taker flow.
+    # We capture ~30% of available taker orders.
+    queue_penalty = 0.30
+
+    probability = base_prob * time_factor * queue_penalty * 0.85  # 85% cap
 
     return max(0.0, min(0.85, probability))
 

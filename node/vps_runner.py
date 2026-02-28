@@ -315,8 +315,11 @@ class VPSRunner:
             # Round-end already calls cancel_all() for cleanup.
             pass  # removed blanket cancel_all — let GTC orders rest
 
-        # Validate and execute
+        # Validate and execute (P0 FIX: cap fills per round for realism)
+        MAX_FILLS_PER_ROUND = 3  # real 5-min markets: 1-3 maker fills max
         for sig in signals:
+            if slot.round_fills >= MAX_FILLS_PER_ROUND:
+                break  # already filled enough this round
             approved, reason = self._risk.check_signal(sig, slot.strategy.state)
             if approved:
                 record = await self._executor.place_order(sig)

@@ -101,8 +101,8 @@ class PaperSimConfig:
     latency_stddev_ms: float = 30.0     # jitter
     latency_min_ms: float = 20.0
     latency_max_ms: float = 500.0
-    # Order book model
-    book_depth_usd: float = 10_000.0    # $10K per side
+    # Order book model (5-min crypto markets have thin books)
+    book_depth_usd: float = 2_000.0     # $2K per side (real: $500-5K)
     book_near_concentration: float = 0.3  # 30% depth within 1 tick
     # Rate limiting
     rate_limit_per_min: int = 60
