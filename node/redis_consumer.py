@@ -90,9 +90,11 @@ class RedisConsumer:
             self._redis = None
 
     def _listen(self):
-        """Background thread: listen for Redis messages."""
-        while self._running and self._pubsub:
+        """Background thread: listen for Redis messages with auto-reconnect."""
+        while self._running:
             try:
+                if self._pubsub is None:
+                    self._reconnect()
                 msg = self._pubsub.get_message(timeout=0.1)
                 if msg and msg["type"] == "message":
                     channel = msg["channel"]
@@ -105,9 +107,39 @@ class RedisConsumer:
 
             except json.JSONDecodeError:
                 pass
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                logger.warning(f"Redis connection lost: {e}. Reconnecting in 3s...")
+                self._pubsub = None
+                time.sleep(3)
             except Exception as e:
                 logger.error(f"Redis consumer error: {e}")
                 time.sleep(1)
+
+    def _reconnect(self):
+        """Rebuild Redis pubsub connection."""
+        try:
+            # Clean up old connection to prevent resource leak
+            if self._redis:
+                try:
+                    self._redis.close()
+                except Exception:
+                    pass
+            rc = self.config.redis
+            kwargs = {
+                "host": rc.host, "port": rc.port, "db": rc.db,
+                "decode_responses": True,
+            }
+            if rc.password:
+                kwargs["password"] = rc.password
+            self._redis = redis.Redis(**kwargs)
+            self._redis.ping()
+            self._pubsub = self._redis.pubsub()
+            self._pubsub.subscribe(rc.ch_prediction, rc.ch_control)
+            logger.info("Redis consumer reconnected")
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.warning(f"Redis reconnect failed: {e}. Retrying in 5s...")
+            self._pubsub = None
+            time.sleep(5)
 
     def _handle_prediction(self, data: dict):
         """Process a prediction message from the brain."""

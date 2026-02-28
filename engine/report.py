@@ -14,8 +14,8 @@ import json
 import sys
 import os
 
-sys.path.insert(0, "/opt")
-
+# L7 FIX: Use relative path from this file instead of hardcoding /opt
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 from polymarket.engine.trade_ledger import TradeLedger
 
 
@@ -33,6 +33,12 @@ def print_report(stats: dict):
     print(f"  Signals:   {stats['total_signals']}")
     print(f"  Fills:     {stats['total_fills']} ({stats['fill_rate']})")
     print(f"  Volume:    {stats['total_volume']}")
+    # Maker rebate estimate
+    rebate = stats.get('total_rebate_estimate', 0)
+    if rebate > 0:
+        print(f"  Rebate~:   ${rebate:+.2f}  (est. 20% of taker fees on our fills)")
+        adj_pnl = stats.get('total_pnl_raw', 0) + rebate
+        print(f"  Adj P&L:   ${adj_pnl:+.2f}  (P&L + rebate)")
     print()
 
     # Per-strategy breakdown
@@ -50,9 +56,11 @@ def print_report(stats: dict):
     if stats["daily"]:
         print("─── Daily ───")
         for d in stats["daily"]:
-            pnl_val = float(d["pnl"].replace("$", "").replace("+", ""))
+            # d['pnl'] comes as formatted string like "$+1.23" or "$-0.50"
+            pnl_str = str(d["pnl"])
+            pnl_val = float(pnl_str.replace("$", "").replace("+", "").replace(",", ""))
             bar = "█" * max(1, int(abs(pnl_val) * 2))
-            color = "+" if not d["pnl"].startswith("$-") else "-"
+            color = "+" if pnl_val >= 0 else "-"
             print(f"  {d['date']}  Rounds={d['rounds']:3d}  "
                   f"Wins={d['wins']:3d}  P&L={d['pnl']:>8s}  {bar}")
         print()
@@ -73,7 +81,11 @@ def print_report(stats: dict):
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Paper Trading Report")
     parser.add_argument("--days", type=int, default=7, help="Report period (days)")
-    parser.add_argument("--db", default="/opt/polymarket/data/paper_trades.db",
+    # Auto-detect db path: VPS (/opt/polymarket/data) or local (data/)
+    default_db = "/opt/polymarket/data/paper_trades.db"
+    if not os.path.exists(default_db):
+        default_db = "data/paper_trades.db"
+    parser.add_argument("--db", default=default_db,
                         help="Path to SQLite database")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()

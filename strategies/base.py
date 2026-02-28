@@ -63,6 +63,7 @@ class StrategyState:
     total_pnl_usd: float = 0.0
     rounds_traded: int = 0
     rounds_won: int = 0
+    rounds_skipped: int = 0     # rounds with zero signals
     consecutive_losses: int = 0
 
     # Current round

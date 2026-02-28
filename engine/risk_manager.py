@@ -22,6 +22,9 @@ class RiskState:
     active_orders_count: int = 0
     last_reset_day: int = 0
 
+    # Per-asset exposure
+    exposure_per_asset: dict = field(default_factory=dict)  # {"btc": 35.0, "eth": 20.0}
+
     # Circuit breaker
     is_paused: bool = False
     pause_until: float = 0.0
@@ -94,7 +97,28 @@ class RiskManager:
             )
             return False, f"Consecutive loss pause: {strategy_state.consecutive_losses} losses"
 
+        # --- Per-asset exposure limit ---
+        asset = signal.market.asset
+        current_asset_exposure = self.state.exposure_per_asset.get(asset, 0.0)
+        max_per_asset = sc.max_position_usd * 2  # allow 2x single position per asset
+        if current_asset_exposure + signal.size_usd > max_per_asset:
+            return False, (
+                f"Asset exposure limit: {asset.upper()} ${current_asset_exposure:.0f}+${signal.size_usd:.0f} "
+                f"> max ${max_per_asset:.0f}"
+            )
+
         return True, "approved"
+
+    def record_exposure(self, asset: str, amount_usd: float):
+        """Update per-asset exposure after a fill."""
+        self.state.exposure_per_asset[asset] = (
+            self.state.exposure_per_asset.get(asset, 0.0) + amount_usd
+        )
+
+    def release_exposure(self, asset: str, amount_usd: float):
+        """Reduce per-asset exposure after round ends (positions settled)."""
+        current = self.state.exposure_per_asset.get(asset, 0.0)
+        self.state.exposure_per_asset[asset] = max(0.0, current - amount_usd)
 
     def _trigger_pause(self, reason: str, duration: float = 900):
         """Activate circuit breaker."""
@@ -113,6 +137,7 @@ class RiskManager:
         logger.info(f"Daily reset | Final P&L: ${self.state.daily_pnl:+.2f}")
         self.state.daily_pnl = 0.0
         self.state.daily_volume = 0.0
+        self.state.exposure_per_asset = {}  # BUG3 FIX: reset per-asset exposure
 
     def get_status(self) -> dict:
         """Return current risk state for dashboard."""
@@ -120,6 +145,7 @@ class RiskManager:
             "daily_pnl": self.state.daily_pnl,
             "daily_volume": self.state.daily_volume,
             "total_exposure": self.state.total_exposure,
+            "exposure_per_asset": dict(self.state.exposure_per_asset),
             "is_paused": self.state.is_paused,
             "pause_reason": self.state.pause_reason,
         }

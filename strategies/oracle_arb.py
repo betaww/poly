@@ -1,17 +1,20 @@
 """
-Strategy 2: Oracle Latency Arbitrage (5-minute version).
+Strategy 2: Oracle-Informed Maker Strategy (5-minute version).
 
-Ported from Alpha-Sigma V7's 15-minute strategy.
-Exploits the 50-2000ms delay between CEX price discovery and Chainlink settlement.
+Post-Feb 2026 Polymarket rules: taker fees are 1.56% at p=0.50,
+but GTC maker orders have 0% fee + 20% taker fee rebate.
 
 How it works:
   1. OBSERVATION (T > 15s): Build price context, no trading
   2. PREPARATION (T <= 15s): Start tracking direction, watch for reversals
-  3. COMMITMENT (T-7s to T-3s): Execute if confidence > 95%
-  4. BLACKOUT (T < 3s): Too late, no trading
+  3. COMMITMENT (T-10s to T-5s): Place GTC MAKER orders if confident
+  4. BLACKOUT (T < 5s): Too late for maker fills
 
-Uses synthetic oracle (weighted average of Binance/Coinbase/Kraken/OKX)
-to predict Chainlink settlement price before it's finalized.
+Key post-Feb-2026 changes:
+  - GTC (maker) instead of FOK (taker) → 0% fee vs 1.56%
+  - T-10s entry instead of T-7s → backed by backtest showing T-10s
+    determines 15-20% of 5-min candles
+  - Maker rebate income on top of settlement profit
 """
 import logging
 import time
@@ -35,11 +38,13 @@ class Phase(str, Enum):
 
 class OracleArbStrategy(BaseStrategy):
     """
-    Oracle Latency Arbitrage — predicts Chainlink settlement 50-200ms in advance.
+    Oracle-Informed Maker Strategy — places GTC maker orders based on
+    CEX price direction in the final 10 seconds of each round.
 
-    Key difference from Alpha-Sigma V7 (15m):
-      - 5-minute windows = 3x more trading opportunities
-      - Same synthetic oracle logic, adapted commitment window
+    Key post-Feb-2026 design:
+      - 0% maker fee + daily USDC rebates
+      - GTC limit orders at 0.90-0.95 based on confidence
+      - Entry at T-10s backed by backtest data
     """
 
     def __init__(self, config: Config):
@@ -48,6 +53,7 @@ class OracleArbStrategy(BaseStrategy):
         # Synthetic oracle inputs
         self._cex_price: float = 0.0
         self._strike_price: float = 0.0
+        self._volatility: float = 0.01  # from brain predictions
 
         # Tracking
         self._direction_history: list[str] = []  # "Up" or "Down"
@@ -60,16 +66,17 @@ class OracleArbStrategy(BaseStrategy):
         """Determine current trading phase based on time remaining."""
         t = market.seconds_remaining
         sc = self.config.strategy
-        # commitment_window_start=7, commitment_window_end=3
+        # POST-FEB-2026 TIMING: shifted earlier for GTC maker orders
+        # commitment_window_start=10, commitment_window_end=5
         # OBSERVATION: t > 15s      (too early)
-        # PREPARATION: 7s < t <= 15s (tracking, no trading)
-        # COMMITMENT:  3s < t <= 7s  (execute if confident)
-        # BLACKOUT:    t <= 3s       (too late)
+        # PREPARATION: 10s < t <= 15s (tracking, no trading)
+        # COMMITMENT:  5s < t <= 10s  (place GTC makers if confident)
+        # BLACKOUT:    t <= 5s        (too late for maker fills)
         if t > 15:
             return Phase.OBSERVATION
-        elif t > sc.commitment_window_start:  # t > 7
+        elif t > sc.commitment_window_start:  # t > 10
             return Phase.PREPARATION
-        elif t > sc.commitment_window_end:    # t > 3
+        elif t > sc.commitment_window_end:    # t > 5
             return Phase.COMMITMENT
         else:
             return Phase.BLACKOUT
@@ -79,6 +86,10 @@ class OracleArbStrategy(BaseStrategy):
 
     def set_strike_price(self, strike: float):
         self._strike_price = strike
+
+    def set_volatility(self, vol: float):
+        """Update volatility from brain predictions."""
+        self._volatility = max(0.001, vol)
 
     def _predict_direction(self) -> tuple[str, float]:
         """
@@ -117,29 +128,33 @@ class OracleArbStrategy(BaseStrategy):
 
     def _calculate_edge(self, direction: str, confidence: float, market: MarketInfo) -> float:
         """
-        Calculate trading edge.
-        Edge = P(win) - cost_of_entry
+        Calculate trading edge for GTC maker orders.
 
-        Uses Polymarket dynamic taker fee:
-          fee = C × feeRate × (p(1-p))^exponent
-          effective_rate ≈ feeRate × (p(1-p))^exponent / p
-        For FOK orders at p=0.50: effective rate ≈ 1.56%
+        Post-Feb 2026: GTC maker orders have 0% fee + rebate.
+        Edge = P(win) - entry_price  (no taker fee deduction)
         """
-        if direction == "Up":
-            entry_cost = market.price_up  # cost to buy "Up" token
-        else:
-            entry_cost = market.price_down  # cost to buy "Down" token
-
-        # Dynamic fee: feeRate × (p(1-p))^exponent
-        p = entry_cost
-        fee_factor = market.fee_rate * (p * (1 - p)) ** market.fee_exponent
-        # fee_factor is per-share, effective cost increase = fee_factor / p
-        effective_cost = entry_cost + fee_factor
-
-        # Edge = predicted probability - effective cost
-        edge = confidence - effective_cost
+        # For GTC maker, we set the price ourselves (typically 0.90-0.95)
+        # Edge = confidence - entry_price (no fee for maker)
+        maker_price = self._get_maker_price(confidence)
+        edge = confidence - maker_price
 
         return edge
+
+    def _get_maker_price(self, confidence: float) -> float:
+        """
+        Calculate optimal GTC maker order price.
+
+        Higher confidence → can afford higher price (still profitable).
+        Target: 0.90-0.95 range for high-confidence directions.
+        """
+        if confidence >= 0.98:
+            return 0.95  # very confident, place near top
+        elif confidence >= 0.95:
+            return 0.92  # standard high-confidence
+        elif confidence >= 0.90:
+            return 0.88  # moderate confidence, want more margin
+        else:
+            return 0.85  # lower confidence, need bigger edge
 
     def _calculate_size(self, edge: float, confidence: float) -> float:
         """Kelly criterion position sizing (1/4 Kelly for safety)."""
@@ -151,6 +166,11 @@ class OracleArbStrategy(BaseStrategy):
         # Full Kelly = edge / (odds - 1), simplified for binary
         # 1/4 Kelly for conservative sizing
         kelly_size = sc.kelly_fraction * edge * sc.max_position_usd
+
+        # I5 FIX: volatility-aware sizing — reduce when vol > 2x normal
+        if self._volatility > 0.02:  # > 2% (2x the 1% normal)
+            vol_factor = 0.5  # halve size in high vol
+            kelly_size *= vol_factor
 
         return max(sc.order_size_usd, min(kelly_size, sc.max_position_usd))
 
@@ -241,28 +261,28 @@ class OracleArbStrategy(BaseStrategy):
         # Calculate position size
         size = self._calculate_size(edge, confidence)
 
-        # Build signal
+        # Build signal — GTC MAKER order (0% fee + rebate)
         outcome = Outcome.UP if direction == "Up" else Outcome.DOWN
-        target_price = market.price_up if direction == "Up" else market.price_down
+        maker_price = self._get_maker_price(confidence)
 
         signal = Signal(
             market=market,
             outcome=outcome,
             side=Side.BUY,
-            price=min(target_price + 0.02, 0.99),  # aggressive price for fill
+            price=maker_price,  # GTC limit price (0.90-0.95)
             size_usd=size,
             confidence=confidence,
             reason=(
                 f"OracleArb: {direction} | conf={confidence:.1%} | edge={edge:.1%} | "
                 f"cex={self._cex_price:.2f} vs strike={self._strike_price:.2f} | "
-                f"T-{market.seconds_remaining:.0f}s"
+                f"maker@${maker_price:.2f} | T-{market.seconds_remaining:.0f}s"
             ),
-            order_type="FOK",  # Fill-or-kill for speed
+            order_type="GTC",  # POST-FEB-2026: GTC maker (0% fee + rebate)
         )
 
         self._signal_sent_this_round = True
         self._logger.info(
-            f"🎯 SIGNAL: {direction} @ ${size:.2f} | "
+            f"🎯 SIGNAL: {direction} GTC@${maker_price:.2f} × ${size:.2f} | "
             f"conf={confidence:.1%} edge={edge:.1%} | "
             f"T-{market.seconds_remaining:.0f}s | reversals={self._reversal_count}"
         )
@@ -303,16 +323,17 @@ class OracleArbStrategy(BaseStrategy):
             self.state.daily_pnl_usd += pnl
             self.state.total_pnl_usd += pnl
 
-            # BUG FIX: Only increment rounds_traded for rounds we actually traded
+            # BUG4 FIX: Don't call super().on_round_end() — it would double-count rounds_traded
             self.state.rounds_traded += 1
+            self.state.reset_round()  # clear positions for next round
             self._logger.info(
                 f"Round end: {market.asset.upper()} | Outcome={settled_outcome} | "
                 f"PnL={self.state.daily_pnl_usd:+.2f}"
             )
         else:
             # No trade this round — skip rounds_traded increment
-            # Don't call super() which would incorrectly inflate rounds_traded
-            pass
+            self.state.rounds_skipped += 1
+            self.state.reset_round()  # still need to clear positions
 
         # Reset strike for next round
         self._strike_price = 0.0

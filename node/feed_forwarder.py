@@ -24,12 +24,23 @@ class FeedForwarder:
     """Connects to exchange WebSockets and forwards prices to Redis."""
 
     def __init__(self, redis_host: str, redis_port: int, redis_password: str):
-        self._redis = redis.Redis(
-            host=redis_host, port=redis_port, password=redis_password,
-            decode_responses=True,
-        )
+        self._redis_host = redis_host
+        self._redis_port = redis_port
+        self._redis_password = redis_password
+        self._redis = self._connect_redis()
         self._running = False
+        # Heartbeat tracking
+        self._tick_counts: dict[str, int] = {}   # {"binance:btc": count}
+        self._last_tick_ts: dict[str, float] = {}  # {"binance:btc": timestamp}
+        self._last_heartbeat = time.time()
         logger.info(f"FeedForwarder Redis: {redis_host}:{redis_port}")
+
+    def _connect_redis(self) -> redis.Redis:
+        """Create Redis connection."""
+        return redis.Redis(
+            host=self._redis_host, port=self._redis_port,
+            password=self._redis_password, decode_responses=True,
+        )
 
     async def start(self):
         self._running = True
@@ -40,12 +51,13 @@ class FeedForwarder:
             asyncio.create_task(self._okx_feed("ETH-USDT", "eth")),
             asyncio.create_task(self._coinbase_feed("BTC-USD", "btc")),
             asyncio.create_task(self._coinbase_feed("ETH-USD", "eth")),
+            asyncio.create_task(self._heartbeat_loop()),
         ]
         logger.info("FeedForwarder started: 6 feeds (Binance+OKX+Coinbase × BTC+ETH)")
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def _publish_tick(self, exchange: str, asset: str, price: float, bid: float, ask: float):
-        """Publish a price tick to Redis."""
+        """Publish a price tick to Redis with auto-reconnect."""
         tick = {
             "exchange": exchange,
             "asset": asset,
@@ -54,7 +66,37 @@ class FeedForwarder:
             "ask": ask,
             "ts": time.time(),
         }
-        self._redis.publish("polymarket:feeds", json.dumps(tick))
+        # Track for heartbeat
+        key = f"{exchange}:{asset}"
+        self._tick_counts[key] = self._tick_counts.get(key, 0) + 1
+        self._last_tick_ts[key] = time.time()
+
+        try:
+            self._redis.publish("polymarket:feeds", json.dumps(tick))
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            logger.warning(f"Redis publish failed: {e}. Reconnecting...")
+            try:
+                self._redis = self._connect_redis()
+                self._redis.publish("polymarket:feeds", json.dumps(tick))
+            except Exception:
+                pass  # will retry on next tick
+
+    async def _heartbeat_loop(self):
+        """Log tick counts per exchange every 60s and detect stale feeds."""
+        while self._running:
+            await asyncio.sleep(60)
+            now = time.time()
+            parts = []
+            stale = []
+            for key, count in sorted(self._tick_counts.items()):
+                parts.append(f"{key}={count}")
+                last = self._last_tick_ts.get(key, 0)
+                if now - last > 30:
+                    stale.append(key)
+            logger.info(f"Heartbeat [60s]: {' | '.join(parts)}")
+            if stale:
+                logger.warning(f"⚠️ STALE FEEDS (>30s no data): {', '.join(stale)}")
+            self._tick_counts = {}  # reset for next interval
 
     # ─── Binance ──────────────────────────────────────────────
 

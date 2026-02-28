@@ -176,8 +176,13 @@ class TradingEngine:
         # Cancel any remaining open orders
         await self._executor.cancel_all()
 
-        # In paper mode, simulate settlement
-        settled = "Up" if market.price_up > 0.5 else "Down"
+        # C2 FIX: Use CEX price vs strike for settlement judgment
+        cex_price = getattr(self._strategy, '_cex_price', 0.0) or 0.0
+        if cex_price > 0 and market.strike_price > 0:
+            settled = "Up" if cex_price > market.strike_price else "Down"
+        else:
+            # Fallback: use market price if no CEX data
+            settled = "Up" if market.price_up > 0.5 else "Down"
 
         await self._strategy.on_round_end(market, settled)
         # Sync strategy P&L to risk manager

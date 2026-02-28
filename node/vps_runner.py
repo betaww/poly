@@ -30,6 +30,7 @@ from ..strategies.base import BaseStrategy
 from ..strategies.crypto_mm import CryptoMarketMaker
 from ..strategies.oracle_arb import OracleArbStrategy
 from ..strategies.reward_harvest import RewardHarvester
+from ..engine.clob_book_feed import CLOBBookFeed
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class StrategySlot:
         self.round_fills = 0
         self.round_cost = 0.0
         self.predicted_direction = ""
+        self.pnl_before_round = 0.0  # snapshot for per-round delta
 
 
 class VPSRunner:
@@ -84,6 +86,9 @@ class VPSRunner:
         self._total_signals = 0
         self._telemetry_interval = 2.0
         self._last_telemetry = 0.0
+        # CLOB orderbook feed for real-time depth
+        self._book_feed = CLOBBookFeed()
+        self._book_subscribed_tokens: set[str] = set()
 
     def _handle_control(self, command: str, data: dict):
         """Handle control commands from Mac dashboard."""
@@ -115,8 +120,23 @@ class VPSRunner:
         if isinstance(strat, CryptoMarketMaker):
             strat.set_cex_price(pred.cex_price)
             strat.set_volatility(pred.volatility)
+            # FIX: CryptoMM needs strike_price for T-10s directional mode
+            if market.strike_price > 0:
+                strat.set_strike_price(market.strike_price)
+            # BLIND SPOT FIX: Feed real CLOB depth to CryptoMM
+            book_up = self._book_feed.get_book(market.token_id_up)
+            book_down = self._book_feed.get_book(market.token_id_down)
+            if book_up and book_down:
+                strat.set_book_data(
+                    best_bid_up=book_up.best_bid, best_ask_up=book_up.best_ask,
+                    best_bid_down=book_down.best_bid, best_ask_down=book_down.best_ask,
+                    depth_bid_usd=book_up.total_bid_depth_usd + book_down.total_bid_depth_usd,
+                    depth_ask_usd=book_up.total_ask_depth_usd + book_down.total_ask_depth_usd,
+                )
         elif isinstance(strat, OracleArbStrategy):
             strat.set_cex_price(pred.cex_price)
+            # BLIND SPOT FIX: OracleArb also needs volatility for sizing
+            strat.set_volatility(pred.volatility)
 
         # Track predicted direction for round recording
         if pred.cex_price > 0 and market.strike_price > 0:
@@ -132,6 +152,8 @@ class VPSRunner:
         # Aggregate across strategies
         total_pnl = sum(s.strategy.state.total_pnl_usd for s in self._slots)
         daily_pnl = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
+        total_rounds = sum(s.strategy.state.rounds_traded for s in self._slots)
+        total_wins = sum(s.strategy.state.rounds_won for s in self._slots)
 
         strat_info = {s.name: {
             "pnl": round(s.strategy.state.total_pnl_usd, 2),
@@ -139,13 +161,24 @@ class VPSRunner:
             "rounds": s.strategy.state.rounds_traded,
         } for s in self._slots}
 
+        # L6 FIX: Include all fields the dashboard expects
         self._redis.publish_telemetry({
             "strategies": strat_info,
+            "strategy": ", ".join(s.name for s in self._slots),
             "mode": self.config.mode,
             "round": self._total_rounds,
+            "rounds_traded": total_rounds,
             "signals": self._total_signals,
             "daily_pnl": round(daily_pnl, 2),
             "total_pnl": round(total_pnl, 2),
+            "win_rate": round(total_wins / max(1, total_rounds), 3),
+            "position_up": sum(s.strategy.state.current_position_up for s in self._slots),
+            "position_down": sum(s.strategy.state.current_position_down for s in self._slots),
+            "risk": {
+                "is_paused": self._risk.state.is_paused,
+                "pause_reason": self._risk.state.pause_reason,
+                "daily_volume": abs(daily_pnl),
+            },
             "brain_connected": self._redis.is_connected,
             "timestamp": now,
         })
@@ -194,20 +227,31 @@ class VPSRunner:
         if not markets:
             return
 
-        # Pick best market per asset
-        primary = self.config.market.assets[0]
-        market = None
+        # H6 FIX: Pick best market for EACH configured asset (not just primary)
+        best_markets: dict[str, MarketInfo] = {}
         for m in markets:
-            if m.asset == primary and not m.is_expired:
-                if market is None or m.seconds_remaining > market.seconds_remaining:
-                    market = m
+            if m.is_expired:
+                continue
+            if m.asset not in best_markets or m.seconds_remaining > best_markets[m.asset].seconds_remaining:
+                best_markets[m.asset] = m
 
-        if not market:
+        if not best_markets:
             return
 
-        # Run each strategy on the market
-        for slot in self._slots:
-            await self._run_strategy_on_market(slot, market)
+        # Run each strategy on its assigned asset's market
+        # Each slot tracks one market at a time via current_market.
+        # With N slots and M assets, distribute: slot[i] gets asset[i % M]
+        assets = self.config.market.assets
+        for i, slot in enumerate(self._slots):
+            asset = assets[i % len(assets)] if assets else None
+            if not asset:
+                continue
+            market = best_markets.get(asset)
+            if not market:
+                # Fallback: try any available market
+                market = next(iter(best_markets.values()), None)
+            if market:
+                await self._run_strategy_on_market(slot, market)
 
         # Publish telemetry
         self._publish_telemetry()
@@ -223,8 +267,26 @@ class VPSRunner:
             slot.round_fills = 0
             slot.round_cost = 0.0
             slot.predicted_direction = ""
+            slot.pnl_before_round = slot.strategy.state.total_pnl_usd  # snapshot
             self._total_rounds += 1
             await slot.strategy.on_round_start(market)
+
+            # BLIND SPOT FIX: Subscribe to CLOB orderbook for new market tokens
+            for token_id, (asset, outcome) in [
+                (market.token_id_up, (market.asset, "Up")),
+                (market.token_id_down, (market.asset, "Down")),
+            ]:
+                if token_id and token_id not in self._book_subscribed_tokens:
+                    self._book_subscribed_tokens.add(token_id)
+                    if not self._book_feed.is_connected:
+                        # First market: start the feed with initial tokens
+                        self._book_feed.start({
+                            market.token_id_up: (market.asset, "Up"),
+                            market.token_id_down: (market.asset, "Down"),
+                        })
+                    else:
+                        # Later market: subscribe additional tokens
+                        self._book_feed.subscribe_token(token_id, asset, outcome)
 
         if market.is_expired:
             await self._handle_round_end(slot, market)
@@ -234,11 +296,24 @@ class VPSRunner:
         # Feed brain predictions
         self._feed_predictions_to_strategy(slot, market)
 
+        # CRIT2 FIX: Poll for live order fills (live mode only)
+        if self.config.mode != "paper":
+            filled_records = await self._executor.poll_live_fills()
+            for record in filled_records:
+                sig = record.signal
+                await slot.strategy.on_fill(sig, record.fill_price, record.fill_size)
+                slot.round_fills += 1
+                slot.round_cost += record.fill_price * record.fill_size
+                self._risk.record_exposure(market.asset, record.fill_price * record.fill_size)
+
         # Generate signals
         signals = await slot.strategy.on_market_update(market)
 
         if signals:
-            await self._executor.cancel_all()
+            # CRIT3 FIX: Don't cancel ALL orders — our GTC makers need time to rest.
+            # Only cancel orders from PREVIOUS rounds (older than current round start).
+            # Round-end already calls cancel_all() for cleanup.
+            pass  # removed blanket cancel_all — let GTC orders rest
 
         # Validate and execute
         for sig in signals:
@@ -262,24 +337,34 @@ class VPSRunner:
                     await slot.strategy.on_fill(sig, record.fill_price, record.fill_size)
                     slot.round_fills += 1
                     slot.round_cost += record.fill_price * record.fill_size
+                    # Track per-asset exposure for risk manager
+                    self._risk.record_exposure(market.asset, record.fill_price * record.fill_size)
 
     async def _handle_round_end(self, slot: StrategySlot, market: MarketInfo):
         """Handle end of round for a strategy."""
         await self._executor.cancel_all()
-        settled = "Up" if market.price_up > 0.5 else "Down"
-        await slot.strategy.on_round_end(market, settled)
 
-        # Record round to ledger
-        pnl = slot.strategy.state.daily_pnl_usd  # approximate
+        # C2 FIX: Use CEX price vs strike for settlement, not market.price_up
         pred = self._redis.get_prediction(market.asset)
         cex_price = pred.cex_price if pred else 0
+        if cex_price > 0 and market.strike_price > 0:
+            settled = "Up" if cex_price > market.strike_price else "Down"
+        else:
+            # Fallback: use market price if no CEX data
+            settled = "Up" if market.price_up > 0.5 else "Down"
+            logger.warning(f"No CEX price for settlement, using market price fallback")
+
+        await slot.strategy.on_round_end(market, settled)
+
+        # C3 FIX: Record per-round PnL delta, not cumulative
+        round_pnl = slot.strategy.state.total_pnl_usd - slot.pnl_before_round
 
         self._ledger.record_round(
             strategy=slot.name,
             market=market,
             settled=settled,
             predicted=slot.predicted_direction,
-            pnl=slot.strategy.state.total_pnl_usd,  # cumulative
+            pnl=round_pnl,
             cost=slot.round_cost,
             signals=slot.round_signals,
             fills=slot.round_fills,
@@ -289,11 +374,14 @@ class VPSRunner:
         # Sync to risk manager
         total_daily = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
         self._risk.state.daily_pnl = total_daily
+        # Release per-asset exposure since positions are settled
+        self._risk.release_exposure(market.asset, slot.round_cost)
 
     async def _shutdown(self):
         await self._executor.cancel_all()
         await self._scanner.close()
         self._redis.stop()
+        self._book_feed.stop()
 
         # Print per-strategy summary
         for slot in self._slots:

@@ -37,10 +37,20 @@ class CryptoMarketMaker(BaseStrategy):
         self._cex_price: Optional[float] = None
         self._strike_price: Optional[float] = None
         self._volatility: float = 0.01  # initial estimate
+        self._directional_sent: bool = False  # one directional signal per round
 
         # Track cost per side for accurate P&L
         self._cost_up: float = 0.0     # total USD spent buying Up tokens
         self._cost_down: float = 0.0   # total USD spent buying Down tokens
+
+        # Real CLOB orderbook data (populated by vps_runner from clob_book_feed)
+        self._book_bid_up: float = 0.0
+        self._book_ask_up: float = 0.0
+        self._book_bid_down: float = 0.0
+        self._book_ask_down: float = 0.0
+        self._book_depth_bid: float = 0.0   # total bid depth USD
+        self._book_depth_ask: float = 0.0   # total ask depth USD
+        self._has_book_data: bool = False
 
     def set_cex_price(self, price: float):
         """Update current CEX price (called by data feed)."""
@@ -53,6 +63,18 @@ class CryptoMarketMaker(BaseStrategy):
     def set_volatility(self, vol: float):
         """Update volatility estimate (from rolling std of returns)."""
         self._volatility = max(0.001, vol)
+
+    def set_book_data(self, best_bid_up: float, best_ask_up: float,
+                      best_bid_down: float, best_ask_down: float,
+                      depth_bid_usd: float, depth_ask_usd: float):
+        """Update real CLOB orderbook data."""
+        self._book_bid_up = best_bid_up
+        self._book_ask_up = best_ask_up
+        self._book_bid_down = best_bid_down
+        self._book_ask_down = best_ask_down
+        self._book_depth_bid = depth_bid_usd
+        self._book_depth_ask = depth_ask_usd
+        self._has_book_data = True
 
     def _estimate_fair_probability(self, market: MarketInfo) -> float:
         """
@@ -88,12 +110,20 @@ class CryptoMarketMaker(BaseStrategy):
     def _calculate_spread(self, market: MarketInfo) -> float:
         """
         Dynamic spread based on:
-          - Base spread from config
+          - Real CLOB spread (if available) — BLIND SPOT FIX
+          - Base spread from config (fallback)
           - Volatility multiplier
           - Time remaining (wider spread near settlement)
         """
         sc = self.config.strategy
-        base = sc.base_spread
+
+        # BLIND SPOT FIX: Use real CLOB spread as baseline if available
+        if self._has_book_data and self._book_bid_up > 0 and self._book_ask_up < 1:
+            real_spread = self._book_ask_up - self._book_bid_up
+            # Don't go tighter than real market spread (we'd get picked off)
+            base = max(sc.base_spread, real_spread * 1.1)  # 10% wider than market
+        else:
+            base = sc.base_spread
 
         # Volatility adjustment: higher vol = wider spread
         vol_mult = 1.0 + (self._volatility / 0.01) * 0.5
@@ -107,7 +137,18 @@ class CryptoMarketMaker(BaseStrategy):
         else:
             time_mult = 1.0
 
-        spread = base * vol_mult * time_mult
+        # Depth adjustment: thin book = wider spread
+        if self._has_book_data and self._book_depth_bid > 0:
+            if self._book_depth_bid < 2000:  # less than $2K depth
+                depth_mult = 1.5  # much wider
+            elif self._book_depth_bid < 5000:
+                depth_mult = 1.2  # slightly wider
+            else:
+                depth_mult = 1.0
+        else:
+            depth_mult = 1.0
+
+        spread = base * vol_mult * time_mult * depth_mult
         return max(sc.min_spread, min(sc.max_spread, spread))
 
     def _round_to_tick(self, price: float, tick_size: str) -> float:
@@ -118,15 +159,33 @@ class CryptoMarketMaker(BaseStrategy):
     async def on_market_update(self, market: MarketInfo) -> list[Signal]:
         """
         Generate two-sided quotes on each market update.
-        Returns 2 signals (buy Up + buy Down) or 4 signals (full two-sided).
+
+        Post-Feb 2026 enhancement: in the last 10 seconds, if CEX price
+        clearly favors one direction, switch to one-sided directional
+        maker orders for settlement profit.
         """
         # Don't quote if paused
         if self.should_pause():
             return []
 
         # Don't quote too close to settlement
-        if market.seconds_remaining < 5:
+        if market.seconds_remaining < 3:
             return []
+
+        # --- T-10s DIRECTIONAL MODE ---
+        # In last 10 seconds, if direction is clear, go one-sided (once per round)
+        if (market.seconds_remaining <= 10 and not self._directional_sent and
+            self._cex_price and self._cex_price > 0 and
+            self._strike_price and self._strike_price > 0):
+
+            distance = (self._cex_price - self._strike_price) / self._strike_price
+            abs_distance = abs(distance)
+
+            # If CEX is >0.1% from strike, direction is highly likely
+            if abs_distance > 0.001:
+                direction = "Up" if distance > 0 else "Down"
+                self._directional_sent = True
+                return self._generate_directional_signal(market, direction)
 
         # Don't quote too frequently
         now = time.time()
@@ -213,12 +272,58 @@ class CryptoMarketMaker(BaseStrategy):
 
         return signals
 
+    def _generate_directional_signal(self, market: MarketInfo, direction: str) -> list[Signal]:
+        """
+        T-10s Directional Mode: place one-sided GTC maker order
+        on the likely winning side for settlement profit.
+
+        Called when CEX price is >0.1% from strike with <10s remaining.
+        Dynamic pricing: more distance = higher price (more confident).
+        """
+        outcome = Outcome.UP if direction == "Up" else Outcome.DOWN
+
+        # I1 FIX: Dynamic maker price based on distance from strike
+        distance = abs(self._cex_price - self._strike_price) / self._strike_price
+        if distance > 0.005:     # >0.5% from strike — very confident
+            maker_price = 0.95
+        elif distance > 0.002:   # >0.2% from strike
+            maker_price = 0.92
+        elif distance > 0.001:   # >0.1% from strike
+            maker_price = 0.88
+        else:
+            maker_price = 0.85   # close to strike — need bigger edge
+
+        order_size = self.config.strategy.order_size_usd
+
+        signal = Signal(
+            market=market,
+            outcome=outcome,
+            side=Side.BUY,
+            price=maker_price,
+            size_usd=order_size,
+            confidence=0.95,
+            reason=(
+                f"MM T-10s directional: {direction} GTC@${maker_price:.2f} | "
+                f"cex={self._cex_price:.2f} vs strike={self._strike_price:.2f} | "
+                f"dist={distance:.4%} | T-{market.seconds_remaining:.0f}s"
+            ),
+            order_type="GTC",
+        )
+
+        self._logger.info(
+            f"🎯 T-10s DIRECTIONAL: {direction} GTC@${maker_price:.2f} × ${order_size:.0f} | "
+            f"T-{market.seconds_remaining:.0f}s"
+        )
+
+        return [signal]
+
     async def on_round_start(self, market: MarketInfo):
         """Reset round-specific tracking."""
         await super().on_round_start(market)
         self._cost_up = 0.0
         self._cost_down = 0.0
         self._last_quote_time = 0  # allow immediate first quote
+        self._directional_sent = False  # reset for new round
 
     async def on_fill(self, signal: Signal, fill_price: float, fill_size: float):
         """Track cost per side for accurate P&L."""
@@ -264,7 +369,9 @@ class CryptoMarketMaker(BaseStrategy):
         elif pnl < 0:
             self.state.consecutive_losses += 1
 
-        await super().on_round_end(market, settled_outcome)
+        # CRIT4 FIX: Don't call super().on_round_end() — it would double-count rounds_traded
+        self.state.rounds_traded += 1
+        self.state.reset_round()  # clear position state for next round
         self._logger.info(
             f"Round P&L: ${pnl:+.2f} (payout=${payout:.2f} cost=${net_cost:.2f}) | "
             f"Daily: ${self.state.daily_pnl_usd:+.2f} | "

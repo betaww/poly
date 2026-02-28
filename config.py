@@ -82,8 +82,8 @@ class StrategyConfig:
     # --- Oracle Arbitrage ---
     oracle_confidence_threshold: float = 0.95  # min confidence to trade
     oracle_min_edge: float = 0.05              # 5% minimum edge
-    commitment_window_start: int = 7           # T-7s start committing
-    commitment_window_end: int = 3             # T-3s stop committing
+    commitment_window_start: int = 10          # T-10s start committing (GTC maker)
+    commitment_window_end: int = 5              # T-5s stop (need time for maker fill)
     kelly_fraction: float = 0.25               # 1/4 Kelly sizing
 
     # --- Risk Management ---
@@ -94,14 +94,32 @@ class StrategyConfig:
 
 
 @dataclass
+class PaperSimConfig:
+    """Paper trading simulator parameters."""
+    # Latency model
+    latency_mean_ms: float = 80.0       # VPS in same region as CLOB
+    latency_stddev_ms: float = 30.0     # jitter
+    latency_min_ms: float = 20.0
+    latency_max_ms: float = 500.0
+    # Order book model
+    book_depth_usd: float = 10_000.0    # $10K per side
+    book_near_concentration: float = 0.3  # 30% depth within 1 tick
+    # Rate limiting
+    rate_limit_per_min: int = 60
+    # Default volatility for GTC fill probability
+    default_volatility: float = 0.05    # 5% for crypto 5-min
+
+
+@dataclass
 class OracleConfig:
     """Synthetic oracle configuration."""
     # Exchange weights for price aggregation
     weights: dict = field(default_factory=lambda: {
-        "binance": 0.45,
+        # Only include exchanges we actually have feeds for
+        # Kraken removed: no feed → permanently missing → confidence penalty
+        "binance": 0.50,     # was 0.45, absorbed kraken share
         "coinbase": 0.30,
-        "kraken": 0.15,
-        "okx": 0.10,
+        "okx": 0.20,         # was 0.10, absorbed kraken share
     })
     # CEX WebSocket endpoints
     binance_ws: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
@@ -141,6 +159,7 @@ class Config:
     api: APIConfig = field(default_factory=APIConfig)
     market: MarketConfig = field(default_factory=MarketConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    paper_sim: PaperSimConfig = field(default_factory=PaperSimConfig)
     oracle: OracleConfig = field(default_factory=OracleConfig)
     redis: RedisConfig = field(default_factory=RedisConfig)
 

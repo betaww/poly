@@ -65,7 +65,14 @@ class MarketInfo:
 
     @property
     def midpoint(self) -> float:
-        return (self.price_up + self.price_down) / 2
+        """Midpoint of the Up outcome token.
+
+        CRIT1 FIX: On Polymarket, price_up + price_down ≈ $1.00 always,
+        so (price_up + price_down)/2 ≈ 0.50 which is useless.
+        The correct midpoint for strategy pricing is the current market
+        consensus probability for Up (i.e. price_up itself).
+        """
+        return self.price_up
 
 
 class MarketScanner:
@@ -108,17 +115,48 @@ class MarketScanner:
         return [current_end, next_end]
 
     @staticmethod
-    def _parse_strike(question: str) -> float:
-        """Parse strike price from market question text.
+    def _parse_strike(question: str, asset: str = "") -> float:
+        """Parse strike price from market question text with multi-pattern fallback.
         
         Examples:
           "Will BTC be above $84,500.00 at 2:30 PM?" → 84500.0
           "Will ETH be above $2,250.50 at 3:00 PM?"  → 2250.5
+          "BTC above 84500 at 14:30"                  → 84500.0
         """
+        # Pattern 1: $XX,XXX.XX (standard format)
         match = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', question)
         if match:
-            return float(match.group(1).replace(',', ''))
-        return 0.0
+            strike = float(match.group(1).replace(',', ''))
+        else:
+            # Pattern 2: naked number after "above" or "below"
+            match = re.search(r'(?:above|below)\s+([0-9,]+(?:\.[0-9]+)?)', question, re.IGNORECASE)
+            if match:
+                strike = float(match.group(1).replace(',', ''))
+            else:
+                # Pattern 3: any large number in the string (last resort)
+                numbers = re.findall(r'[0-9,]+\.?[0-9]*', question)
+                candidates = [float(n.replace(',', '')) for n in numbers if float(n.replace(',', '')) > 100]
+                if candidates:
+                    strike = max(candidates)  # largest number is likely the strike
+                    logger.warning(f"Strike parsed via fallback (largest number): ${strike:,.2f} from '{question}'")
+                else:
+                    logger.warning(f"❌ Strike parse FAILED: '{question}'")
+                    return 0.0
+
+        # Sanity check: strike must be in realistic range for the asset
+        SANITY = {
+            "btc": (10_000, 500_000),
+            "eth": (100, 50_000),
+            "sol": (1, 5_000),
+        }
+        lo, hi = SANITY.get(asset.lower(), (0, 1_000_000))
+        if not (lo <= strike <= hi):
+            logger.warning(
+                f"⚠️ Strike ${strike:,.2f} out of range [{lo:,}-{hi:,}] for {asset.upper()}, "
+                f"using anyway but may be wrong. Question: '{question}'"
+            )
+
+        return strike
 
     def _make_slug(self, asset: str, window_end: int) -> str:
         """Build deterministic slug."""
@@ -208,7 +246,7 @@ class MarketScanner:
                 neg_risk=market.get("negRisk", False),
                 fee_rate=0.25,       # fixed for 5m/15m crypto
                 fee_exponent=2,      # fixed for 5m/15m crypto
-                strike_price=self._parse_strike(market.get("question", "")),
+                strike_price=self._parse_strike(market.get("question", ""), asset),
             )
 
         except Exception as e:

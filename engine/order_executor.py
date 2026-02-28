@@ -54,12 +54,23 @@ class OrderExecutor:
         # Realistic paper trading simulator
         self._simulator = None
         if self.is_paper:
-            from .paper_simulator import PaperSimulator, LatencyConfig
+            from .paper_simulator import PaperSimulator, LatencyConfig, OrderBookConfig
+            psc = config.paper_sim
             latency = LatencyConfig(
-                mean_ms=80.0 if config.node == "vps" else 150.0,
-                stddev_ms=30.0 if config.node == "vps" else 50.0,
+                mean_ms=psc.latency_mean_ms if config.node == "vps" else psc.latency_mean_ms * 1.8,
+                stddev_ms=psc.latency_stddev_ms if config.node == "vps" else psc.latency_stddev_ms * 1.5,
+                min_ms=psc.latency_min_ms,
+                max_ms=psc.latency_max_ms,
             )
-            self._simulator = PaperSimulator(latency_config=latency)
+            book = OrderBookConfig(
+                total_depth_usd=psc.book_depth_usd,
+                near_concentration=psc.book_near_concentration,
+            )
+            self._simulator = PaperSimulator(
+                latency_config=latency,
+                book_config=book,
+                rate_limit=psc.rate_limit_per_min,
+            )
         else:
             self._init_clob_client()
 
@@ -127,14 +138,20 @@ class OrderExecutor:
             )
         else:
             # Maker order: probabilistic fill, 0% fee
-            # In 5-min markets, GTC orders rest for ~60s on average
+            # FIX: Use actual time remaining, not hardcoded 60s
+            # OracleArb enters at T-10s, CryptoMM T-10s directional both need short resting
+            t_remaining = getattr(signal.market, 'seconds_remaining', 60.0)
+            resting_time = max(3.0, min(t_remaining, 60.0))  # clamp to 3-60s
+            # Use config volatility if available, fallback to 5%
+            vol = getattr(self.config, 'paper_sim', None)
+            default_vol = vol.default_volatility if vol else 0.05
             result = self._simulator.simulate_gtc_order(
                 price=signal.price,
                 size_usd=signal.size_usd,
                 midpoint=midpoint,
                 is_buy=is_buy,
-                seconds_resting=60.0,  # 5-min round, realistic resting time
-                volatility=0.05,       # crypto 5-min vol ~5%
+                seconds_resting=resting_time,
+                volatility=default_vol,
             )
 
         if result.filled:
@@ -235,6 +252,42 @@ class OrderExecutor:
             self._orders[record.order_id] = record
             logger.error(f"Order placement failed: {e}", exc_info=True)
             return record
+
+    async def poll_live_fills(self) -> list[OrderRecord]:
+        """CRIT2 FIX: Poll live orders for fills.
+
+        In production, this should be replaced by User channel WebSocket
+        (wss://ws-subscriptions-clob.polymarket.com/ws/user) for instant
+        fill notifications. Polling is a reliable fallback.
+        """
+        filled = []
+        if self.is_paper or not self._clob_client:
+            return filled
+
+        for oid, record in list(self._orders.items()):
+            if record.status != "live":
+                continue
+            try:
+                order = self._clob_client.get_order(oid)
+                if order and isinstance(order, dict):
+                    status = order.get("status", "")
+                    if status == "matched":
+                        record.status = "matched"
+                        record.fill_price = float(order.get("price", record.signal.price))
+                        record.fill_size = float(order.get("size_matched", 0))
+                        record.updated_at = time.time()
+                        filled.append(record)
+                        logger.info(
+                            f"[LIVE] Fill detected: {oid} @ {record.fill_price:.3f} "
+                            f"x {record.fill_size:.1f}"
+                        )
+                    elif status in ("canceled", "expired"):
+                        record.status = "canceled"
+                        record.updated_at = time.time()
+            except Exception as e:
+                logger.debug(f"Poll failed for {oid}: {e}")
+
+        return filled
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a specific order."""

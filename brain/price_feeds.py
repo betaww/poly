@@ -229,8 +229,12 @@ class SyntheticOracle:
             return 0.0, 0.0
 
         # Weighted average of available prices
+        # BLIND SPOT FIX: normalize weights to sum=1.0 using only AVAILABLE exchanges
+        # Without this, if Kraken (15% weight) is down, total_weight < 1.0
+        # and the result is correct BUT confidence should reflect fewer sources
         total_weight = 0.0
         weighted_sum = 0.0
+        available_count = 0
 
         for exchange, weight in self.weights.items():
             if exchange in self.prices:
@@ -241,6 +245,7 @@ class SyntheticOracle:
                 effective_weight = weight * staleness_factor
                 weighted_sum += self.prices[exchange] * effective_weight
                 total_weight += effective_weight
+                available_count += 1
 
         if total_weight == 0:
             return 0.0, 0.0
@@ -252,10 +257,16 @@ class SyntheticOracle:
             prices = list(self.prices.values())
             median = sorted(prices)[len(prices) // 2]
             max_deviation = max(abs(p - median) / median for p in prices) if median > 0 else 0
-            # Low deviation = high confidence
-            confidence = max(0.5, 1.0 - max_deviation * 100)
+            # M3 FIX: multiplier was 100 (way too aggressive — 0.01% diff killed confidence)
+            # Changed to 10: 0.1% deviation → confidence 0.99, 1% → 0.90
+            confidence = max(0.5, 1.0 - max_deviation * 10)
+            # BLIND SPOT FIX: fewer sources = lower confidence
+            expected_sources = len(self.weights)
+            source_penalty = available_count / max(expected_sources, 1)
+            confidence *= source_penalty  # e.g., 2/4 sources → 50% penalty
+            confidence = max(0.5, confidence)
         else:
-            confidence = 0.7  # single source = lower confidence
+            confidence = 0.6  # single source = lower confidence
 
         self._prediction_history.append(predicted)
         if len(self._prediction_history) > 300:

@@ -87,13 +87,31 @@ class TradeLedger:
             volume      REAL DEFAULT 0,
             fees        REAL DEFAULT 0,
             max_drawdown REAL DEFAULT 0,
-            strategies  TEXT DEFAULT ''
+            strategies  TEXT DEFAULT '',
+            maker_volume REAL DEFAULT 0,
+            rebate_estimate REAL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_rounds_ts ON rounds(ts);
         CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(ts);
         CREATE INDEX IF NOT EXISTS idx_rounds_strategy ON rounds(strategy);
         """)
+        self._db.commit()
+
+        # Schema migration: add new columns if upgrading existing DB
+        self._migrate_schema()
+
+    def _migrate_schema(self):
+        """Add new columns to existing databases (safe: ignores if already exist)."""
+        migrations = [
+            "ALTER TABLE daily ADD COLUMN maker_volume REAL DEFAULT 0",
+            "ALTER TABLE daily ADD COLUMN rebate_estimate REAL DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                self._db.execute(sql)
+            except Exception:
+                pass  # column already exists
         self._db.commit()
 
     def record_order(self, strategy: str, signal, result) -> int:
@@ -187,6 +205,8 @@ class TradeLedger:
                 volume = volume + ?,
                 fees = fees + (SELECT COALESCE(SUM(fee_usd), 0) FROM orders 
                               WHERE ts > ? AND ts < ?),
+                maker_volume = maker_volume + ?,
+                rebate_estimate = rebate_estimate + ?,
                 strategies = ?
             WHERE date = ?
             """, (
@@ -197,14 +217,17 @@ class TradeLedger:
                 pnl,
                 cost,
                 time.time() - 300, time.time(),
+                cost,  # all our orders are maker (GTC), so maker_volume = cost
+                cost * 0.01 * 0.20,  # rebate ~ 20% of ~1% taker fee our counterparty pays
                 ",".join(strategies),
                 date,
             ))
         else:
+            rebate_est = cost * 0.01 * 0.20
             self._db.execute("""
-            INSERT INTO daily (date, rounds, wins, losses, signals, fills, pnl, volume, strategies)
-            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
-            """, (date, correct, 1 - correct, signals, fills, pnl, cost, strategy))
+            INSERT INTO daily (date, rounds, wins, losses, signals, fills, pnl, volume, strategies, maker_volume, rebate_estimate)
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (date, correct, 1 - correct, signals, fills, pnl, cost, strategy, cost, rebate_est))
         self._db.commit()
 
     def get_stats(self, days: int = 7) -> dict:
@@ -221,6 +244,13 @@ class TradeLedger:
         total_signals = sum(r["signals"] for r in daily_rows)
         total_fills = sum(r["fills"] for r in daily_rows)
         total_volume = sum(r["volume"] for r in daily_rows)
+        # Maker rebate estimate (may not exist in older DBs)
+        try:
+            total_rebate = sum(r["rebate_estimate"] for r in daily_rows)
+            total_maker_vol = sum(r["maker_volume"] for r in daily_rows)
+        except (IndexError, KeyError):
+            total_rebate = 0.0
+            total_maker_vol = 0.0
 
         # Per-strategy breakdown
         strategy_stats = {}
@@ -266,6 +296,9 @@ class TradeLedger:
             "total_fills": total_fills,
             "fill_rate": f"{total_fills / max(total_signals, 1):.1%}",
             "total_volume": f"${total_volume:,.2f}",
+            "total_rebate_estimate": round(total_rebate, 2),
+            "total_maker_volume": round(total_maker_vol, 2),
+            "total_pnl_raw": round(total_pnl, 2),
             "strategies": strategy_stats,
             "daily": [{
                 "date": r["date"],
