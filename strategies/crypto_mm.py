@@ -1,15 +1,21 @@
 """
-Strategy 1: 5-Minute Crypto Market Making.
+Strategy 1: 5-Minute Crypto Market Making (Up token only).
 
-The primary strategy. Places two-sided quotes on BTC/ETH 5-minute Up/Down markets.
+The primary strategy. Places BUY/SELL quotes on Up tokens in BTC/ETH 5-minute markets.
 
 How it works:
-  1. Estimate settlement probability using mid-price from Binance/Coinbase vs Chainlink strike
-  2. Place bid (buy) at probability - spread/2, ask (sell) at probability + spread/2
-  3. Adjust spread dynamically based on volatility and time remaining
-  4. Every 5 minutes the market settles automatically — no overnight risk
+  1. Estimate settlement probability using CEX price vs Chainlink strike
+  2. Place BID (buy) at probability - spread/2 to acquire Up tokens
+  3. Place ASK (sell) at probability + spread/2 to sell held Up tokens
+  4. Profit = bid-ask spread on completed round trips
+  5. Unsold tokens settle at $1.00 (if Up wins) or $0.00 (if Down wins)
 
-Key advantage: 0% maker fees (100% rebate) = lowest-cost market maker in the pool.
+IMPORTANT: Only trades Up tokens. Down tokens are NOT traded because:
+  - Selling a token you don't own is NOT possible on Polymarket
+  - SELL Down ≡ BUY Up economically (via CTF split/merge)
+  - Trading both sides double-counts the same directional bet
+
+Key advantage: 0% maker fees (100% rebate) = lowest-cost market maker.
 """
 import logging
 import time
@@ -25,10 +31,11 @@ logger = logging.getLogger(__name__)
 
 class CryptoMarketMaker(BaseStrategy):
     """
-    5-Minute Binary Options Market Maker.
+    5-Minute Binary Options Market Maker (Up token only).
 
-    Earns spread by providing liquidity on both "Up" and "Down" outcomes.
+    Earns spread by buying Up tokens cheap and selling them at a premium.
     Uses CEX price data to estimate fair probability, then quotes around it.
+    SELL signals are only generated when we hold inventory (no naked shorts).
     """
 
     def __init__(self, config: Config):
@@ -39,9 +46,11 @@ class CryptoMarketMaker(BaseStrategy):
         self._volatility: float = 0.01  # initial estimate
         self._directional_sent: bool = False  # one directional signal per round
 
-        # Track cost per side for accurate P&L
-        self._cost_up: float = 0.0     # total USD spent buying Up tokens
-        self._cost_down: float = 0.0   # total USD spent buying Down tokens
+        # Inventory tracking (Up token only)
+        self._buy_cost: float = 0.0       # total USD spent buying Up tokens
+        self._sell_revenue: float = 0.0   # total USD received selling Up tokens
+        self._shares_bought: float = 0.0  # total shares purchased
+        self._shares_sold: float = 0.0    # total shares sold
 
         # Real CLOB orderbook data (populated by vps_runner from clob_book_feed)
         self._book_bid_up: float = 0.0
@@ -158,11 +167,12 @@ class CryptoMarketMaker(BaseStrategy):
 
     async def on_market_update(self, market: MarketInfo) -> list[Signal]:
         """
-        Generate two-sided quotes on each market update.
+        Generate Up-token quotes on each market update.
 
-        Post-Feb 2026 enhancement: in the last 10 seconds, if CEX price
-        clearly favors one direction, switch to one-sided directional
-        maker orders for settlement profit.
+        BUY Up: always allowed (acquire inventory)
+        SELL Up: only when we hold shares (no naked selling)
+
+        T-10s directional mode: BUY the likely winning side.
         """
         # Don't quote if paused
         if self.should_pause():
@@ -173,7 +183,7 @@ class CryptoMarketMaker(BaseStrategy):
             return []
 
         # --- T-10s DIRECTIONAL MODE ---
-        # In last 10 seconds, if direction is clear, go one-sided (once per round)
+        # In last 10 seconds, if direction is clear, BUY the winning side
         if (market.seconds_remaining <= 10 and not self._directional_sent and
             self._cex_price and self._cex_price > 0 and
             self._strike_price and self._strike_price > 0):
@@ -196,77 +206,52 @@ class CryptoMarketMaker(BaseStrategy):
 
         # Estimate fair probability
         prob_up = self._estimate_fair_probability(market)
-        prob_down = 1.0 - prob_up
 
         # Calculate spread
         spread = self._calculate_spread(market)
         half_spread = spread / 2.0
 
-        # Generate quotes
+        # Generate Up-token quotes only
         signals = []
         tick = market.tick_size
         order_size = self.config.strategy.order_size_usd
 
-        # --- "Up" side ---
-        bid_up_price = self._round_to_tick(prob_up - half_spread, tick)
-        ask_up_price = self._round_to_tick(prob_up + half_spread, tick)
-
-        if 0.01 <= bid_up_price <= 0.99:
+        # BID: Buy Up tokens (always allowed — acquiring inventory)
+        bid_price = self._round_to_tick(prob_up - half_spread, tick)
+        if 0.01 <= bid_price <= 0.99:
             signals.append(Signal(
                 market=market,
                 outcome=Outcome.UP,
                 side=Side.BUY,
-                price=bid_up_price,
+                price=bid_price,
                 size_usd=order_size,
                 confidence=0.6,
-                reason=f"MM bid Up @ {bid_up_price:.2f} (fair={prob_up:.3f}, spread={spread:.3f})",
+                reason=f"MM bid Up @ {bid_price:.2f} (fair={prob_up:.3f}, spread={spread:.3f})",
                 order_type="GTC",
             ))
 
-        if 0.01 <= ask_up_price <= 0.99:
-            signals.append(Signal(
-                market=market,
-                outcome=Outcome.UP,
-                side=Side.SELL,
-                price=ask_up_price,
-                size_usd=order_size,
-                confidence=0.6,
-                reason=f"MM ask Up @ {ask_up_price:.2f} (fair={prob_up:.3f}, spread={spread:.3f})",
-                order_type="GTC",
-            ))
-
-        # --- "Down" side ---
-        bid_down_price = self._round_to_tick(prob_down - half_spread, tick)
-        ask_down_price = self._round_to_tick(prob_down + half_spread, tick)
-
-        if 0.01 <= bid_down_price <= 0.99:
-            signals.append(Signal(
-                market=market,
-                outcome=Outcome.DOWN,
-                side=Side.BUY,
-                price=bid_down_price,
-                size_usd=order_size,
-                confidence=0.6,
-                reason=f"MM bid Down @ {bid_down_price:.2f} (fair={prob_down:.3f})",
-                order_type="GTC",
-            ))
-
-        if 0.01 <= ask_down_price <= 0.99:
-            signals.append(Signal(
-                market=market,
-                outcome=Outcome.DOWN,
-                side=Side.SELL,
-                price=ask_down_price,
-                size_usd=order_size,
-                confidence=0.6,
-                reason=f"MM ask Down @ {ask_down_price:.2f} (fair={prob_down:.3f})",
-                order_type="GTC",
-            ))
+        # ASK: Sell Up tokens (ONLY if we hold inventory)
+        inventory_shares = self._shares_bought - self._shares_sold
+        if inventory_shares > 0:
+            ask_price = self._round_to_tick(prob_up + half_spread, tick)
+            if 0.01 <= ask_price <= 0.99:
+                # Don't sell more than we hold
+                sell_usd = min(order_size, inventory_shares * ask_price)
+                signals.append(Signal(
+                    market=market,
+                    outcome=Outcome.UP,
+                    side=Side.SELL,
+                    price=ask_price,
+                    size_usd=sell_usd,
+                    confidence=0.6,
+                    reason=f"MM ask Up @ {ask_price:.2f} (inv={inventory_shares:.1f} shares)",
+                    order_type="GTC",
+                ))
 
         if signals:
             self._logger.info(
-                f"Quotes: Up bid={bid_up_price:.2f}/ask={ask_up_price:.2f} | "
-                f"Down bid={bid_down_price:.2f}/ask={ask_down_price:.2f} | "
+                f"Quotes: Up bid={bid_price:.2f} | "
+                f"inv={inventory_shares:.1f} shares | "
                 f"spread={spread:.3f} | T-{market.seconds_remaining:.0f}s"
             )
 
@@ -320,45 +305,52 @@ class CryptoMarketMaker(BaseStrategy):
     async def on_round_start(self, market: MarketInfo):
         """Reset round-specific tracking."""
         await super().on_round_start(market)
-        self._cost_up = 0.0
-        self._cost_down = 0.0
+        self._buy_cost = 0.0
+        self._sell_revenue = 0.0
+        self._shares_bought = 0.0
+        self._shares_sold = 0.0
         self._last_quote_time = 0  # allow immediate first quote
         self._directional_sent = False  # reset for new round
 
     async def on_fill(self, signal: Signal, fill_price: float, fill_size: float):
-        """Track cost per side for accurate P&L."""
+        """Track inventory and cost/revenue for correct PnL."""
         await super().on_fill(signal, fill_price, fill_size)
         cost = fill_price * fill_size
         if signal.side == Side.BUY:
-            if signal.outcome == Outcome.UP:
-                self._cost_up += cost   # spent money buying Up tokens
-            else:
-                self._cost_down += cost # spent money buying Down tokens
-        else:
-            # SELL: tokens sold = revenue = negative cost
-            if signal.outcome == Outcome.UP:
-                self._cost_up -= cost   # received money selling Up tokens
-            else:
-                self._cost_down -= cost # received money selling Down tokens
+            self._buy_cost += cost
+            self._shares_bought += fill_size
+        else:  # SELL
+            self._sell_revenue += cost
+            self._shares_sold += fill_size
 
     async def on_round_end(self, market: MarketInfo, settled_outcome: Optional[str] = None):
-        """Calculate round P&L and update state."""
-        # Binary market settlement:
-        #   "Up" wins  → Up tokens pay $1 each, Down tokens pay $0
-        #   "Down" wins → Down tokens pay $1 each, Up tokens pay $0
-        # Net cost per side = (bought - sold) in dollars
-        # P&L = settlement_payout - net_cost_of_remaining_tokens
-        payout = 0.0
-        # net cost = positive means we're net long (spent > received)
-        net_cost = self._cost_up + self._cost_down
+        """Calculate round PnL with correct inventory-based accounting.
 
-        # Only tokens still HELD pay out; tokens already sold are captured in cost
+        PnL = realized_trading_profit + settlement_payout_on_unsold_tokens
+
+        Realized trading profit = sell_revenue - buy_cost_of_shares_sold
+        Settlement payout = unsold_shares × ($1.00 if Up wins, $0.00 if Down wins)
+        Settlement cost = buy_cost_of_unsold_shares
+        """
+        # Inventory state
+        unsold_shares = self._shares_bought - self._shares_sold
+
+        # Average cost per share (prevent div by zero)
+        avg_cost = self._buy_cost / self._shares_bought if self._shares_bought > 0 else 0
+
+        # Realized PnL from completed round-trips (buy then sell)
+        cost_of_sold = avg_cost * self._shares_sold
+        realized_pnl = self._sell_revenue - cost_of_sold
+
+        # Settlement PnL on unsold inventory
+        cost_of_unsold = avg_cost * unsold_shares
         if settled_outcome == "Up":
-            payout = max(0, self.state.current_position_up) * 1.0
-        elif settled_outcome == "Down":
-            payout = max(0, self.state.current_position_down) * 1.0
+            settlement_payout = unsold_shares * 1.0  # Up tokens pay $1.00
+        else:
+            settlement_payout = 0.0  # Up tokens pay $0 if Down wins
+        settlement_pnl = settlement_payout - cost_of_unsold
 
-        pnl = payout - net_cost
+        pnl = realized_pnl + settlement_pnl
 
         self.state.daily_pnl_usd += pnl
         self.state.total_pnl_usd += pnl
@@ -369,12 +361,11 @@ class CryptoMarketMaker(BaseStrategy):
         elif pnl < 0:
             self.state.consecutive_losses += 1
 
-        # CRIT4 FIX: Don't call super().on_round_end() — it would double-count rounds_traded
         self.state.rounds_traded += 1
-        self.state.reset_round()  # clear position state for next round
+        self.state.reset_round()
         self._logger.info(
-            f"Round P&L: ${pnl:+.2f} (payout=${payout:.2f} cost=${net_cost:.2f}) | "
+            f"Round PnL: ${pnl:+.2f} (realized=${realized_pnl:+.2f} settlement=${settlement_pnl:+.2f}) | "
+            f"inv={unsold_shares:.1f}sh @${avg_cost:.3f} | "
             f"Daily: ${self.state.daily_pnl_usd:+.2f} | "
-            f"Total: ${self.state.total_pnl_usd:+.2f} | "
             f"Win rate: {self.state.win_rate:.1%}"
         )
