@@ -53,9 +53,10 @@ class FeedForwarder:
         "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": "eth",
     }
     # Chainlink Polygon mainnet Price Feed proxy contracts
+    # Verified from https://data.chain.link/feeds/polygon/mainnet/
     CHAINLINK_FEEDS = {
-        "btc": "0xc907A4bc44122d645e9981358C895a9B48977F6f",
-        "eth": "0xF96825BFe640c313c0A5F90B2E15a0c863C55945",
+        "btc": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+        "eth": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
     }
     # AggregatorV3Interface.latestRoundData() ABI (only what we need)
     AGGREGATOR_ABI = [{"inputs":[], "name":"latestRoundData", "outputs":[{"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},{"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},{"name":"answeredInRound","type":"uint80"}], "stateMutability":"view", "type":"function"}]
