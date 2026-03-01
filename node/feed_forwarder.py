@@ -310,7 +310,7 @@ class FeedForwarder:
         """
         rpc_url = os.environ.get(
             "POLYGON_RPC_URL",
-            "https://polygon-rpc.com",  # free public RPC
+            "https://polygon.drpc.org",  # free public RPC (tested from VPS)
         )
         while self._running:
             try:
