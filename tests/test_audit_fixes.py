@@ -466,7 +466,7 @@ class TestBidirectionalTrading:
         self.sniper._buy_cost = 6.0  # $0.60 per share
         self.sniper._trade_direction = "Down"
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             self.sniper.on_round_end(market, "Down")
         )
         # Down wins → $1.00/share × 10 - $6.00 cost = $4.00 profit
@@ -487,7 +487,7 @@ class TestBidirectionalTrading:
         self.sniper._buy_cost = 6.0
         self.sniper._trade_direction = "Down"
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             self.sniper.on_round_end(market, "Up")
         )
         # Up wins → Down token = $0.00, loss = -$6.00
@@ -547,7 +547,7 @@ class TestKellySizing:
         self.sniper._buy_cost = 6.0
         self.sniper._trade_direction = "Up"
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             self.sniper.on_round_end(market, "Up")
         )
         assert self.sniper._bankroll > initial_bankroll
@@ -742,7 +742,7 @@ class TestD1EMATrend:
         assert self.sniper._ema_initialized is True
 
         # Start round 2 — EMA should persist
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             self.sniper.on_round_start(market)
         )
         assert self.sniper._ema_initialized is True, "EMA should persist across rounds"
