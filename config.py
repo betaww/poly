@@ -81,7 +81,7 @@ class StrategyConfig:
 
     # --- DirectionalSniper (v6) ---
     sniper_base_price: float = 0.60    # maker bid price (break-even = win_rate)
-    sniper_min_confidence: float = 0.65  # minimum confidence to fire
+    sniper_min_confidence: float = 0.55  # minimum confidence to fire (lowered from 0.65 — oracle 88% accurate)
     sniper_window_start: int = 10      # T-10s start committing
     sniper_window_end: int = 5         # T-5s stop (maker needs fill time)
     # E2: Kelly sizing parameters

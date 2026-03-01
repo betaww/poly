@@ -140,17 +140,22 @@ class DirectionalSniper(BaseStrategy):
             confidence = 0.50 + z_score * 0.10              # 50-55%
 
         # D1: EMA trend adjustment — reward momentum alignment, punish divergence
+        conf_after_zscore = confidence  # diagnostic
         if self._ema_initialized and self._ema_slow > 0:
             trend = (self._ema_fast - self._ema_slow) / self._ema_slow
             if (direction == "Up" and trend > 0) or (direction == "Down" and trend < 0):
                 # Trend confirms direction → boost confidence (max +10%)
                 confidence *= 1.0 + min(abs(trend) * 500, 0.10)
             else:
-                # Trend opposes direction → reduce confidence (max -20%)
-                confidence *= max(0.80, 1.0 - abs(trend) * 500)
+                # Trend opposes direction → reduce confidence (max -10%)
+                # Reduced from -20% — 5-min markets have weak trend signals
+                confidence *= max(0.90, 1.0 - abs(trend) * 300)
+
+        conf_after_d1 = confidence  # diagnostic
 
         # D2: Bayesian fusion with CLOB implied probability
-        if 0.05 < self._clob_midpoint < 0.95:
+        # Skip when CLOB is in 0.45-0.55 "uninformed" zone (market is 50/50)
+        if (0.05 < self._clob_midpoint < 0.45) or (0.55 < self._clob_midpoint < 0.95):
             p_clob = self._clob_midpoint  # CLOB's market-implied P(Up)
             p_cex = confidence if direction == "Up" else (1.0 - confidence)
             # Guard: avoid log(0) or division-by-zero with extreme values
@@ -163,6 +168,12 @@ class DirectionalSniper(BaseStrategy):
             # Convert back to directional confidence, clamp to valid range
             confidence = fused_up if direction == "Up" else (1.0 - fused_up)
             confidence = max(0.50, min(0.95, confidence))
+
+        # Diagnostic: log pipeline stages
+        self._logger.debug(
+            f"Conf pipeline: z={conf_after_zscore:.3f} → D1={conf_after_d1:.3f} → D2={confidence:.3f} | "
+            f"dir={direction} clob={self._clob_midpoint:.3f} vol={self._volatility:.5f}"
+        )
 
         return direction, min(confidence, 0.95)
 
@@ -292,7 +303,7 @@ class DirectionalSniper(BaseStrategy):
             return []
 
         # Confidence threshold
-        min_confidence = getattr(self.config.strategy, 'sniper_min_confidence', 0.65)
+        min_confidence = getattr(self.config.strategy, 'sniper_min_confidence', 0.55)
 
         # D3: Time-decay urgency bonus — later signals are more informative
         # T-10s → +0.00, T-5s → +0.05
@@ -300,8 +311,9 @@ class DirectionalSniper(BaseStrategy):
         confidence += time_bonus
 
         if confidence < min_confidence:
-            self._logger.debug(
-                f"Skip: confidence {confidence:.1%} < {min_confidence:.1%}"
+            self._logger.info(
+                f"Skip: confidence {confidence:.1%} < {min_confidence:.1%} | "
+                f"cex=${self._cex_price:.2f} strike=${self._strike_price:.2f} T-{t:.0f}s"
             )
             return []
 
