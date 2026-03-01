@@ -269,6 +269,28 @@ class VPSRunner:
             slot.predicted_direction = ""
             slot.pnl_before_round = slot.strategy.state.total_pnl_usd  # snapshot
             self._total_rounds += 1
+
+            # DYNAMIC STRIKE: Polymarket 5-min markets resolve
+            # "Up if price at END ≥ price at START". There is NO fixed strike
+            # in the question text. We use CEX price at round start as strike.
+            if market.strike_price <= 0:
+                pred = self._redis.get_prediction(market.asset)
+                if pred and pred.cex_price > 0:
+                    market.strike_price = pred.cex_price
+                    logger.info(
+                        f"Dynamic strike set: {market.asset.upper()} "
+                        f"${market.strike_price:,.2f} (CEX at round start)"
+                    )
+                else:
+                    # Fallback: use strategy's cached CEX price
+                    strat = slot.strategy
+                    if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
+                        market.strike_price = strat._cex_price
+                        logger.info(
+                            f"Dynamic strike set (fallback): {market.asset.upper()} "
+                            f"${market.strike_price:,.2f}"
+                        )
+
             await slot.strategy.on_round_start(market)
 
             # BLIND SPOT FIX: Subscribe to CLOB orderbook for new market tokens
