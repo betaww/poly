@@ -31,6 +31,7 @@ from ..strategies.base import BaseStrategy
 from ..strategies.crypto_mm import CryptoMarketMaker
 from ..strategies.oracle_arb import OracleArbStrategy
 from ..strategies.reward_harvest import RewardHarvester
+from ..strategies.directional_sniper import DirectionalSniper
 from ..engine.clob_book_feed import CLOBBookFeed
 from .redis_consumer import RedisConsumer
 
@@ -56,12 +57,13 @@ class VPSRunner:
     """
 
     STRATEGY_REGISTRY = {
+        "sniper": lambda c: DirectionalSniper(c),
         "crypto_mm": lambda c: CryptoMarketMaker(c),
         "oracle_arb": lambda c: OracleArbStrategy(c),
         "reward_harvest": lambda c: RewardHarvester(c),
     }
 
-    def __init__(self, config: Config, strategy_name: str = "crypto_mm"):
+    def __init__(self, config: Config, strategy_name: str = "sniper"):
         self.config = config
         self._scanner = MarketScanner(config)
         self._executor = OrderExecutor(config)
@@ -118,13 +120,17 @@ class VPSRunner:
             return
 
         strat = slot.strategy
-        if isinstance(strat, CryptoMarketMaker):
+
+        # Universal setters for all strategies that have them
+        if hasattr(strat, 'set_cex_price'):
             strat.set_cex_price(pred.cex_price)
+        if hasattr(strat, 'set_volatility'):
             strat.set_volatility(pred.volatility)
-            # FIX: CryptoMM needs strike_price for T-10s directional mode
-            if market.strike_price > 0:
-                strat.set_strike_price(market.strike_price)
-            # BLIND SPOT FIX: Feed real CLOB depth to CryptoMM
+        if hasattr(strat, 'set_strike_price') and market.strike_price > 0:
+            strat.set_strike_price(market.strike_price)
+
+        # CryptoMM-specific: CLOB book data
+        if isinstance(strat, CryptoMarketMaker):
             book_up = self._book_feed.get_book(market.token_id_up)
             book_down = self._book_feed.get_book(market.token_id_down)
             if book_up and book_down:
@@ -134,10 +140,6 @@ class VPSRunner:
                     depth_bid_usd=book_up.total_bid_depth_usd + book_down.total_bid_depth_usd,
                     depth_ask_usd=book_up.total_ask_depth_usd + book_down.total_ask_depth_usd,
                 )
-        elif isinstance(strat, OracleArbStrategy):
-            strat.set_cex_price(pred.cex_price)
-            # BLIND SPOT FIX: OracleArb also needs volatility for sizing
-            strat.set_volatility(pred.volatility)
 
         # Track predicted direction for round recording
         if pred.cex_price > 0 and market.strike_price > 0:

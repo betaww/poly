@@ -71,7 +71,7 @@ class MarketConfig:
 @dataclass
 class StrategyConfig:
     """Strategy tuning knobs."""
-    # --- Market Making ---
+    # --- Market Making (legacy CryptoMM, kept for reference) ---
     base_spread: float = 0.03          # 3 cents base spread
     min_spread: float = 0.02           # minimum spread
     max_spread: float = 0.08           # max spread in high volatility
@@ -79,7 +79,13 @@ class StrategyConfig:
     max_position_usd: float = 50.0     # max exposure per round
     refresh_interval_ms: int = 1000    # quote refresh rate
 
-    # --- Oracle Arbitrage ---
+    # --- DirectionalSniper (v6) ---
+    sniper_base_price: float = 0.60    # maker bid price (break-even = win_rate)
+    sniper_min_confidence: float = 0.65  # minimum confidence to fire
+    sniper_window_start: int = 10      # T-10s start committing
+    sniper_window_end: int = 5         # T-5s stop (maker needs fill time)
+
+    # --- Oracle Arbitrage (legacy, kept for reference) ---
     oracle_confidence_threshold: float = 0.95  # min confidence to trade
     oracle_min_edge: float = 0.05              # 5% minimum edge
     commitment_window_start: int = 10          # T-10s start committing (GTC maker)
