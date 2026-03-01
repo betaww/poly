@@ -1,8 +1,8 @@
 """
-Alienware Brain Node — Multi-Exchange Price Feeds.
+Alienware Brain Node — Multi-Source Price Feeds.
 
-Connects to Binance, Coinbase, Kraken, OKX via WebSocket.
-Aggregates into a synthetic oracle prediction.
+Aggregates Pyth Network oracle, Binance, Coinbase, OKX exchange feeds,
+and Chainlink Polygon on-chain data into a synthetic oracle prediction.
 Publishes predictions to Redis for VPS consumption.
 
 This node does ONE thing well: predict the Chainlink settlement price
@@ -268,11 +268,8 @@ class SyntheticOracle:
     def _weighted_median(self, prices_weights: list[tuple[float, float]]) -> float:
         """Compute weighted median — matches Chainlink's median-of-medians logic.
 
-        Args:
-            prices_weights: list of (price, effective_weight) tuples
-
-        Returns:
-            The weighted median price.
+        For 2 sources: returns weighted average (avoids systematic lower-price bias).
+        For 3+ sources: proper weighted median (robust to outliers).
         """
         if not prices_weights:
             return 0.0
@@ -281,10 +278,14 @@ class SyntheticOracle:
         total = sum(w for _, w in pw)
         if total == 0:
             return 0.0
+        # Special case: 2 sources — weighted average avoids lower-price bias
+        if len(pw) == 2:
+            return (pw[0][0] * pw[0][1] + pw[1][0] * pw[1][1]) / total
+        # 3+ sources: proper weighted median
         cumulative = 0.0
         for price, weight in pw:
             cumulative += weight
-            if cumulative >= total / 2:
+            if cumulative > total / 2:  # strict > for proper lower-median
                 return price
         return pw[-1][0]  # fallback: last price
 

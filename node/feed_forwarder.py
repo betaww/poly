@@ -252,6 +252,9 @@ class FeedForwarder:
                             if not self._running:
                                 break
                             buffer += chunk.decode("utf-8", errors="ignore")
+                            # Safety: cap buffer to prevent unbounded memory growth
+                            if len(buffer) > 65536:
+                                buffer = buffer[-32768:]  # keep last 32KB
                             # SSE messages are separated by double newlines
                             while "\n\n" in buffer:
                                 event_str, buffer = buffer.split("\n\n", 1)
@@ -315,19 +318,22 @@ class FeedForwarder:
         while self._running:
             try:
                 from web3 import Web3
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
                 if not w3.is_connected():
                     logger.warning("[VPS] Chainlink: Polygon RPC not connected")
                     await asyncio.sleep(30)
                     continue
                 logger.info(f"[VPS] Chainlink Polygon poller started (10s interval)")
+                # Pre-build contract objects (reuse across iterations)
+                contracts = {}
+                for asset, addr in self.CHAINLINK_FEEDS.items():
+                    contracts[asset] = w3.eth.contract(
+                        address=Web3.to_checksum_address(addr),
+                        abi=self.AGGREGATOR_ABI,
+                    )
                 while self._running:
-                    for asset, addr in self.CHAINLINK_FEEDS.items():
+                    for asset, contract in contracts.items():
                         try:
-                            contract = w3.eth.contract(
-                                address=Web3.to_checksum_address(addr),
-                                abi=self.AGGREGATOR_ABI,
-                            )
                             result = contract.functions.latestRoundData().call()
                             # result = (roundId, answer, startedAt, updatedAt, answeredInRound)
                             answer = result[1]
