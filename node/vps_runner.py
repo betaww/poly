@@ -357,15 +357,21 @@ class VPSRunner:
             strat = slot.strategy
             if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
                 cex_price = strat._cex_price
+                logger.debug(f"Settlement: using strategy cached CEX price: ${cex_price:.2f}")
 
-        if cex_price > 0 and market.strike_price > 0:
-            settled = "Up" if cex_price > market.strike_price else "Down"
+        strike = market.strike_price
+
+        if cex_price > 0 and strike > 0:
+            settled = "Up" if cex_price > strike else "Down"
+            logger.info(f"Settlement: CEX=${cex_price:.2f} vs strike=${strike:.2f} → {settled}")
         else:
-            # Last resort: 50/50 coin flip (DO NOT use market.price_up — it's biased
-            # by our own buying activity, leading to 96% false win rate)
+            # Last resort: 50/50 coin flip
             import random
             settled = random.choice(["Up", "Down"])
-            logger.warning(f"No CEX price for settlement, using random 50/50 fallback")
+            logger.warning(
+                f"Settlement fallback 50/50: pred={'yes' if pred else 'no'}, "
+                f"cex=${cex_price:.2f}, strike=${strike:.2f}"
+            )
 
         await slot.strategy.on_round_end(market, settled)
 
