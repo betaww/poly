@@ -21,6 +21,7 @@ import time
 
 import redis
 import websockets
+from datetime import datetime, timezone  # M8 FIX: moved from inner loop
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,6 @@ class FeedForwarder:
                         exchange_ts = 0.0
                         if cb_time:
                             try:
-                                from datetime import datetime, timezone
                                 dt = datetime.fromisoformat(cb_time.replace('Z', '+00:00'))
                                 exchange_ts = dt.timestamp()
                             except (ValueError, TypeError):
@@ -253,9 +253,13 @@ class FeedForwarder:
                             if not self._running:
                                 break
                             buffer += chunk.decode("utf-8", errors="ignore")
-                            # Safety: cap buffer to prevent unbounded memory growth
+                            # L5 FIX: Smart buffer truncation — cut at event boundary
                             if len(buffer) > 65536:
-                                buffer = buffer[-32768:]  # keep last 32KB
+                                last_boundary = buffer.rfind("\n\n", 0, -1)
+                                if last_boundary > 0:
+                                    buffer = buffer[last_boundary + 2:]
+                                else:
+                                    buffer = buffer[-32768:]  # fallback: hard cut
                             # SSE messages are separated by double newlines
                             while "\n\n" in buffer:
                                 event_str, buffer = buffer.split("\n\n", 1)

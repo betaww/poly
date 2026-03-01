@@ -202,6 +202,7 @@ def estimate_gtc_fill_probability(
     seconds_resting: float,
     is_buy: bool,
     volatility: float = 0.01,
+    time_remaining: float = 300.0,  # M5 FIX: seconds until settlement
 ) -> float:
     """
     Estimate probability that a GTC limit order fills.
@@ -210,6 +211,7 @@ def estimate_gtc_fill_probability(
       - Distance from midpoint (closer = more likely)
       - Time resting (longer = more likely)
       - Market volatility (higher vol = more likely to fill)
+      - M5 FIX: Time remaining until settlement (less time = less liquidity)
 
     For buy orders: fills if market drops to our bid
     For sell orders: fills if market rises to our ask
@@ -250,7 +252,14 @@ def estimate_gtc_fill_probability(
     # We capture ~30% of available taker orders.
     queue_penalty = 0.30
 
-    probability = base_prob * time_factor * queue_penalty * 0.85  # 85% cap
+    # M5 FIX: Liquidity dries up near settlement — fewer counterparties.
+    # At T-60s: full liquidity (1.0x). At T-5s: ~40% liquidity.
+    if time_remaining < 30:
+        settlement_factor = 0.4 + 0.6 * (time_remaining / 30.0)
+    else:
+        settlement_factor = 1.0
+
+    probability = base_prob * time_factor * queue_penalty * settlement_factor * 0.85
 
     return max(0.0, min(0.85, probability))
 
@@ -420,6 +429,7 @@ class PaperSimulator:
         is_buy: bool,
         seconds_resting: float = 1.0,
         volatility: float = 0.01,
+        time_remaining: float = 300.0,  # M5 FIX: seconds until settlement
     ) -> SimulationResult:
         """
         Simulate a Good-Till-Canceled (maker) limit order.
@@ -442,6 +452,7 @@ class PaperSimulator:
             seconds_resting=seconds_resting,
             is_buy=is_buy,
             volatility=volatility,
+            time_remaining=time_remaining,  # M5 FIX: forward to fill model
         )
 
         # Roll the dice

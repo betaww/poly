@@ -385,6 +385,9 @@ class DirectionalSniper(BaseStrategy):
         C2 NOTE: We intentionally DO NOT call super().on_round_end() because
         we fully override PnL tracking and rounds_traded counting here.
         BaseStrategy.on_round_end() would double-count rounds_traded.
+
+        ⚠️ MAINTENANCE: If you add NEW logic to BaseStrategy.on_round_end(),
+        you MUST mirror it here manually. This override is the reason.
         """
         if self._shares_bought > 0:
             avg_cost = self._buy_cost / self._shares_bought

@@ -268,6 +268,7 @@ class SyntheticOracle:
     def _weighted_median(self, prices_weights: list[tuple[float, float]]) -> float:
         """Compute weighted median — matches Chainlink's median-of-medians logic.
 
+        For 1 source: returns that price (no median possible).
         For 2 sources: returns weighted average (avoids systematic lower-price bias).
         For 3+ sources: proper weighted median (robust to outliers).
         """
@@ -278,6 +279,9 @@ class SyntheticOracle:
         total = sum(w for _, w in pw)
         if total == 0:
             return 0.0
+        # C1 FIX: 1 source — return price directly (logged as warning upstream)
+        if len(pw) == 1:
+            return pw[0][0]
         # Special case: 2 sources — weighted average avoids lower-price bias
         if len(pw) == 2:
             return (pw[0][0] * pw[0][1] + pw[1][0] * pw[1][1]) / total
@@ -334,16 +338,22 @@ class SyntheticOracle:
             if median > 0:
                 deviations = sorted(abs(p - median) / median for p in active_prices)
                 mad = deviations[len(deviations) // 2]
-                confidence = max(0.5, 1.0 - mad * 20)
+                confidence = max(0.3, 1.0 - mad * 20)  # L6 FIX: floor 0.3 not 0.5
             else:
-                confidence = 0.5
+                confidence = 0.3
             # Source penalty: fewer active sources = lower confidence
             expected_sources = sum(1 for w in self.weights.values() if w > 0)
             source_penalty = available_count / max(expected_sources, 1)
             confidence *= source_penalty
-            confidence = max(0.5, confidence)
+            confidence = max(0.3, confidence)  # L6 FIX: floor 0.3
         else:
-            confidence = 0.6
+            # C1 FIX: single source — cap confidence and warn
+            confidence = 0.45
+            logger.warning(
+                f"⚠️ Only {available_count} active source(s) — "
+                f"confidence capped at {confidence:.0%}. "
+                f"Prices: {active_prices}"
+            )
 
         # Chainlink drift detection — reduce confidence when we diverge from settlement source
         chainlink_age = time.time() - self._chainlink_updated_at
@@ -353,7 +363,7 @@ class SyntheticOracle:
                 # 0.1% drift → -5% conf, 0.5% drift → -25% conf
                 drift_penalty = min(0.30, drift * 50)
                 confidence *= (1.0 - drift_penalty)
-                confidence = max(0.5, confidence)
+                confidence = max(0.3, confidence)  # L6 FIX: floor 0.3
                 logger.info(
                     f"Chainlink drift: {drift:.4%} | "
                     f"ours=${predicted:.2f} vs CL=${self._chainlink_price:.2f} | "
@@ -365,22 +375,28 @@ class SyntheticOracle:
         return predicted, min(confidence, 0.99)
 
     def get_volatility(self) -> float:
-        """P5 FIX: Calculate volatility from RAW ticks, not smoothed predictions.
+        """P5 FIX + M4 FIX: Time-sampled volatility from raw ticks.
 
-        Using raw ticks gives a more accurate picture of actual market volatility,
-        since the weighted average prediction smooths out exchange-to-exchange noise.
+        M4 FIX: Uses 1-second time sampling instead of tick-by-tick returns.
+        This prevents Coinbase's high tick rate (400-600/min) from dominating
+        the volatility estimate over Binance's lower rate (~60/min).
         """
-        # P5: Use raw ticks if available
+        # M4 FIX: Time-sampled volatility (1-second intervals)
         if len(self._raw_ticks) >= 10:
-            recent = list(self._raw_ticks)[-60:]
+            recent = list(self._raw_ticks)[-300:]  # last ~60s of ticks
             if len(recent) >= 2:
-                prices_only = [p for _, p in recent]
-                mean = sum(prices_only) / len(prices_only)
-                if mean > 0:
+                # Build 1-second OHLC-style samples: use last price per second
+                second_prices: dict[int, float] = {}
+                for ts, price in recent:
+                    sec = int(ts)
+                    second_prices[sec] = price  # last tick wins per second
+                sorted_secs = sorted(second_prices.keys())
+                if len(sorted_secs) >= 5:
+                    prices_1s = [second_prices[s] for s in sorted_secs]
                     returns = [
-                        (prices_only[i] - prices_only[i-1]) / prices_only[i-1]
-                        for i in range(1, len(prices_only))
-                        if prices_only[i-1] != 0
+                        (prices_1s[i] - prices_1s[i-1]) / prices_1s[i-1]
+                        for i in range(1, len(prices_1s))
+                        if prices_1s[i-1] != 0
                     ]
                     if returns:
                         variance = sum(r**2 for r in returns) / len(returns)
@@ -403,9 +419,12 @@ class SyntheticOracle:
         return max(0.001, variance ** 0.5)
 
     def get_direction(self, strike_price: float) -> tuple[str, float]:
-        """
-        Predict settlement direction relative to strike.
-        Returns (direction, confidence).
+        """C2 FIX: Predict settlement direction relative to strike.
+
+        Returns (direction, base_confidence) from the Oracle's perspective.
+        NOTE: DirectionalSniper has its own confidence pipeline (z-score + D1 + D2 + D3)
+        and does NOT use this method's confidence directly. This method is retained
+        for potential future use (e.g., passing Oracle base confidence to the strategy).
         """
         predicted, base_conf = self.predict()
         if predicted == 0 or strike_price == 0:
@@ -414,7 +433,7 @@ class SyntheticOracle:
         distance = (predicted - strike_price) / strike_price
         direction = "Up" if distance > 0 else "Down"
 
-        # Amplify confidence based on distance from strike
+        # Simple distance-based confidence — strategy has its own richer pipeline
         abs_dist = abs(distance)
         if abs_dist > 0.001:
             conf = min(0.99, base_conf + abs_dist * 10)

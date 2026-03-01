@@ -44,15 +44,17 @@ logger = logging.getLogger(__name__)
 
 class StrategySlot:
     """Wraps a strategy with its own state tracking."""
-    def __init__(self, strategy: BaseStrategy):
+    def __init__(self, strategy: BaseStrategy, asset: str = ""):
         self.strategy = strategy
         self.name = strategy.name
+        self.asset = asset  # M6 FIX: each slot is bound to one asset
         self.current_market: MarketInfo | None = None
         self.round_signals = 0
         self.round_fills = 0
         self.round_cost = 0.0
         self.predicted_direction = ""
         self.pnl_before_round = 0.0  # snapshot for per-round delta
+        self._settlement_cex_snapshot: float = 0.0  # C4 FIX: explicit init
 
 
 class VPSRunner:
@@ -78,14 +80,18 @@ class VPSRunner:
         db_path = "data/paper_trades.db"
         self._ledger = TradeLedger(db_path)
 
-        # Support comma-separated strategy names: "crypto_mm,oracle_arb"
+        # M6 FIX: Create separate slots per (strategy, asset) pair.
+        # Each slot tracks its own current_market independently,
+        # preventing round-thrashing when multiple assets are active.
         strategy_names = [s.strip() for s in strategy_name.split(",")]
         self._slots: list[StrategySlot] = []
         for name in strategy_names:
             if name not in self.STRATEGY_REGISTRY:
                 raise ValueError(f"Unknown: {name}. Available: {list(self.STRATEGY_REGISTRY.keys())}")
-            strat = self.STRATEGY_REGISTRY[name](config)
-            self._slots.append(StrategySlot(strat))
+            for asset in config.market.assets:
+                strat = self.STRATEGY_REGISTRY[name](config)
+                strat.name = f"{strat.name}-{asset}"  # e.g. "Sniper-btc"
+                self._slots.append(StrategySlot(strat, asset=asset))
 
         self._running = False
         self._last_day = 0
@@ -268,18 +274,12 @@ class VPSRunner:
         if not best_markets:
             return
 
-        # P1.5 FIX: All strategies trade the PRIMARY asset (highest liquidity).
-        # Previously split by index (slot[0]=btc, slot[1]=eth) which misassigned OracleArb.
-        primary_asset = self.config.market.assets[0] if self.config.market.assets else None
-        if not primary_asset:
-            return
-        market = best_markets.get(primary_asset)
-        if not market:
-            market = next(iter(best_markets.values()), None)
-        if not market:
-            return
+        # M6 FIX: Dispatch each market to asset-specific slots only.
+        # Each slot is bound to one asset, preventing round-thrashing.
         for slot in self._slots:
-            await self._run_strategy_on_market(slot, market)
+            market = best_markets.get(slot.asset)
+            if market:
+                await self._run_strategy_on_market(slot, market)
 
         # Publish telemetry
         self._publish_telemetry()
@@ -433,7 +433,7 @@ class VPSRunner:
         """Handle end of round for a strategy."""
         await self._executor.cancel_all()
 
-        # M4 FIX: Sync risk state BEFORE round-end processing
+        # M6 FIX: Sync risk state BEFORE round-end processing
         total_daily = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
         self._risk.state.daily_pnl = total_daily
 
@@ -581,11 +581,12 @@ def main():
     config.node = "vps"
     runner = VPSRunner(config, strategy_name=args.strategy)
 
-    loop = asyncio.get_event_loop()
-    loop.add_signal_handler(signal.SIGINT, runner.stop)
-    loop.add_signal_handler(signal.SIGTERM, runner.stop)
-
-    asyncio.run(runner.start())
+    # M7 FIX: Use asyncio.run() directly — signal handlers registered inside start()
+    # Old code used deprecated asyncio.get_event_loop() which doesn't work in Python 3.12+
+    try:
+        asyncio.run(runner.start())
+    except KeyboardInterrupt:
+        runner.stop()
 
 
 if __name__ == "__main__":

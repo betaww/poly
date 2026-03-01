@@ -31,6 +31,8 @@ class TradeLedger:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        # L2 FIX: WAL mode for better concurrent read/write performance on VPS
+        self._db.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
         logger.info(f"TradeLedger opened: {db_path}")
 

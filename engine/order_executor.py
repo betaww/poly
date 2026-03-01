@@ -176,6 +176,7 @@ class OrderExecutor:
                 is_buy=is_buy,
                 seconds_resting=resting_time,
                 volatility=default_vol,
+                time_remaining=remaining,  # M5 FIX: pass seconds until settlement
             )
 
         if result.filled:

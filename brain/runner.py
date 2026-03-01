@@ -40,7 +40,7 @@ class BrainRunner:
     def __init__(self, config: Config):
         self.config = config
         self._redis: redis.Redis | None = None
-        self._publish_interval = 0.1  # 100ms — publish predictions at 10 Hz
+        self._publish_interval = 1.0  # C3 FIX: 1 Hz (was 0.1s/10Hz — VPS polls 1/s, 90% was wasted)
         self._last_publish = 0.0
         self._running = False
         self._tick_count = 0
@@ -120,12 +120,15 @@ class BrainRunner:
         pubsub.subscribe("polymarket:feeds")
         logger.info("Subscribed to polymarket:feeds")
 
-        for message in pubsub.listen():
-            if not self._running:
-                break
-            if message["type"] != "message":
-                continue
+        # L1 FIX: Use non-blocking get_message instead of blocking listen()
+        # This allows graceful shutdown within 0.5s of self._running = False
+        while self._running:
             try:
+                message = pubsub.get_message(timeout=0.5)
+                if message is None:
+                    continue
+                if message["type"] != "message":
+                    continue
                 d = json.loads(message["data"])
                 tick = PriceTick(
                     exchange=d["exchange"],
@@ -136,6 +139,8 @@ class BrainRunner:
                     timestamp=d.get("ts", time.time()),
                 )
                 self._on_tick(tick)
+            except (json.JSONDecodeError, KeyError):
+                pass  # malformed message, skip
             except Exception as e:
                 logger.error(f"Feed parse error: {e}")
 
