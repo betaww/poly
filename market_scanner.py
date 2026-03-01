@@ -6,6 +6,7 @@ Verified working pattern: events?slug=btc-updown-5m-{ts}
 """
 import time
 import re
+import json
 import math
 import asyncio
 import logging
@@ -112,7 +113,7 @@ class MarketScanner:
         # Previous window (might still be settling)
         prev_end = current_end - duration
 
-        return [current_end, next_end]
+        return [prev_end, current_end, next_end]  # M9 FIX: include prev window
 
     @staticmethod
     def _parse_strike(question: str, asset: str = "") -> float:
@@ -192,13 +193,11 @@ class MarketScanner:
             # Extract CLOB token IDs from clobTokenIds JSON string
             clob_token_ids = market.get("clobTokenIds", "")
             if isinstance(clob_token_ids, str):
-                import json
                 clob_token_ids = json.loads(clob_token_ids)
 
             # Extract outcome prices
             outcome_prices = market.get("outcomePrices", "")
             if isinstance(outcome_prices, str):
-                import json
                 outcome_prices = json.loads(outcome_prices)
 
             # Parse timestamps

@@ -5,7 +5,7 @@ Supports running multiple strategies simultaneously with persistent trade record
 
 Runs:
   - Market Scanner (discover 5-min markets)
-  - Multiple Strategies (crypto_mm + oracle_arb)
+  - Strategy Engine (default: DirectionalSniper v6)
   - Redis Consumer (receive brain predictions)
   - Order Executor (py-clob-client)
   - Risk Manager
@@ -13,7 +13,7 @@ Runs:
 
 Usage:
   python -m user_data.polymarket.node.vps_runner
-  python -m user_data.polymarket.node.vps_runner -s crypto_mm,oracle_arb
+  python -m user_data.polymarket.node.vps_runner -s sniper
 """
 import asyncio
 import logging
@@ -21,6 +21,8 @@ import random
 import signal
 import time
 from datetime import datetime, timezone
+
+import httpx
 
 from ..config import Config
 from ..market_scanner import MarketScanner, MarketInfo
@@ -33,6 +35,8 @@ from ..strategies.oracle_arb import OracleArbStrategy
 from ..strategies.reward_harvest import RewardHarvester
 from ..strategies.directional_sniper import DirectionalSniper
 from ..engine.clob_book_feed import CLOBBookFeed
+from ..engine.alerting import AlertManager
+from ..engine.analytics import PerformanceAnalytics
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -92,6 +96,14 @@ class VPSRunner:
         # CLOB orderbook feed for real-time depth
         self._book_feed = CLOBBookFeed()
         self._book_subscribed_tokens: set[str] = set()
+        # E8: Alert manager
+        self._alerter = AlertManager(config)
+        self._brain_offline_since: float = 0.0
+        self._coinflip_count: int = 0
+        # E4: Performance analytics
+        self._analytics = PerformanceAnalytics()
+        # E3: Wire CLOB feed into executor for real depth
+        self._executor._clob_feed = self._book_feed
 
     def _handle_control(self, command: str, data: dict):
         """Handle control commands from Mac dashboard."""
@@ -129,10 +141,17 @@ class VPSRunner:
         if hasattr(strat, 'set_strike_price') and market.strike_price > 0:
             strat.set_strike_price(market.strike_price)
 
+        # C3 FIX: Update market prices from CLOB book feed in real-time
+        # so midpoint reflects current market, not frozen discovery-time value
+        book_up = self._book_feed.get_book(market.token_id_up)
+        if book_up:
+            market.price_up = book_up.midpoint
+        book_down = self._book_feed.get_book(market.token_id_down)
+        if book_down:
+            market.price_down = book_down.midpoint
+
         # CryptoMM-specific: CLOB book data
         if isinstance(strat, CryptoMarketMaker):
-            book_up = self._book_feed.get_book(market.token_id_up)
-            book_down = self._book_feed.get_book(market.token_id_down)
             if book_up and book_down:
                 strat.set_book_data(
                     best_bid_up=book_up.best_bid, best_ask_up=book_up.best_ask,
@@ -141,9 +160,17 @@ class VPSRunner:
                     depth_ask_usd=book_up.total_ask_depth_usd + book_down.total_ask_depth_usd,
                 )
 
+        # D2: Pass CLOB Up token midpoint to sniper for Bayesian fusion
+        if hasattr(strat, 'set_clob_midpoint') and book_up:
+            strat.set_clob_midpoint(book_up.midpoint)
+
         # Track predicted direction for round recording
         if pred.cex_price > 0 and market.strike_price > 0:
             slot.predicted_direction = "Up" if pred.cex_price > market.strike_price else "Down"
+
+        # M6 FIX: Snapshot CEX price near round end for settlement accuracy
+        if market.seconds_remaining < 3 and pred.cex_price > 0:
+            slot._settlement_cex_snapshot = pred.cex_price
 
     def _publish_telemetry(self):
         """Publish current state to Mac dashboard."""
@@ -155,6 +182,7 @@ class VPSRunner:
         # Aggregate across strategies
         total_pnl = sum(s.strategy.state.total_pnl_usd for s in self._slots)
         daily_pnl = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
+        daily_volume = sum(s.strategy.state.daily_volume_usd for s in self._slots)  # M7 FIX
         total_rounds = sum(s.strategy.state.rounds_traded for s in self._slots)
         total_wins = sum(s.strategy.state.rounds_won for s in self._slots)
 
@@ -164,7 +192,6 @@ class VPSRunner:
             "rounds": s.strategy.state.rounds_traded,
         } for s in self._slots}
 
-        # L6 FIX: Include all fields the dashboard expects
         self._redis.publish_telemetry({
             "strategies": strat_info,
             "strategy": ", ".join(s.name for s in self._slots),
@@ -180,7 +207,7 @@ class VPSRunner:
             "risk": {
                 "is_paused": self._risk.state.is_paused,
                 "pause_reason": self._risk.state.pause_reason,
-                "daily_volume": abs(daily_pnl),
+                "daily_volume": round(daily_volume, 2),  # M7 FIX: actual volume not abs(pnl)
             },
             "brain_connected": self._redis.is_connected,
             "timestamp": now,
@@ -366,40 +393,96 @@ class VPSRunner:
                     # Track per-asset exposure for risk manager
                     self._risk.record_exposure(market.asset, record.fill_price * record.fill_size)
 
+    async def _fetch_settlement_price_http(self, asset: str) -> float:
+        """C6 FIX: Last-resort HTTP REST fallback for settlement price.
+        Used when Brain is offline and strategy cache is empty.
+        """
+        symbol = f"{asset.upper()}USDT"
+        urls = [
+            f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
+            f"https://api.coingecko.com/api/v3/simple/price?ids={'bitcoin' if asset == 'btc' else 'ethereum'}&vs_currencies=usd",
+        ]
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Try Binance first
+                try:
+                    resp = await client.get(urls[0])
+                    if resp.status_code == 200:
+                        price = float(resp.json()["price"])
+                        logger.info(f"Settlement HTTP fallback (Binance): {asset.upper()} ${price:,.2f}")
+                        return price
+                except Exception as e:
+                    logger.debug(f"Binance HTTP fallback failed: {e}")
+
+                # Try CoinGecko
+                try:
+                    resp = await client.get(urls[1])
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        key = "bitcoin" if asset == "btc" else "ethereum"
+                        price = float(data[key]["usd"])
+                        logger.info(f"Settlement HTTP fallback (CoinGecko): {asset.upper()} ${price:,.2f}")
+                        return price
+                except Exception as e:
+                    logger.debug(f"CoinGecko HTTP fallback failed: {e}")
+        except Exception as e:
+            logger.error(f"HTTP settlement fallback failed entirely: {e}")
+        return 0.0
+
     async def _handle_round_end(self, slot: StrategySlot, market: MarketInfo):
         """Handle end of round for a strategy."""
         await self._executor.cancel_all()
 
-        # Settlement: determine if Up or Down won
-        # Priority: 1) Brain CEX prediction, 2) Strategy's cached CEX price, 3) coin flip
-        pred = self._redis.get_prediction(market.asset)
-        cex_price = pred.cex_price if pred else 0
+        # M4 FIX: Sync risk state BEFORE round-end processing
+        total_daily = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
+        self._risk.state.daily_pnl = total_daily
 
-        # Fallback: use strategy's own cached CEX price if Brain is offline
+        # Settlement: determine if Up or Down won
+        # Priority: 1) M6 CEX snapshot near T-0, 2) Brain prediction,
+        #           3) Strategy cache, 4) HTTP REST fallback, 5) coin flip
+        cex_price = 0.0
+
+        # M6 FIX: prefer snapshot taken near T-0s
+        if hasattr(slot, '_settlement_cex_snapshot') and slot._settlement_cex_snapshot > 0:
+            cex_price = slot._settlement_cex_snapshot
+            logger.debug(f"Settlement: using T-0 snapshot: ${cex_price:.2f}")
+
+        # Fallback 1: current Brain prediction
+        if cex_price <= 0:
+            pred = self._redis.get_prediction(market.asset)
+            if pred and pred.cex_price > 0:
+                cex_price = pred.cex_price
+
+        # Fallback 2: strategy's cached CEX price
         if cex_price <= 0:
             strat = slot.strategy
             if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
                 cex_price = strat._cex_price
                 logger.debug(f"Settlement: using strategy cached CEX price: ${cex_price:.2f}")
 
+        # C6 FIX: Fallback 3: HTTP REST call before coin flip
+        if cex_price <= 0:
+            cex_price = await self._fetch_settlement_price_http(market.asset)
+
         strike = market.strike_price
 
         if cex_price > 0 and strike > 0:
-            settled = "Up" if cex_price > strike else "Down"
+            # C1 FIX: Polymarket rule is "Up if END >= START", use >= not >
+            settled = "Up" if cex_price >= strike else "Down"
             logger.info(f"Settlement: CEX=${cex_price:.2f} vs strike=${strike:.2f} → {settled}")
         else:
-            # Last resort: 50/50 coin flip (P2.6: random imported at top)
+            # Absolute last resort: 50/50 coin flip
             settled = random.choice(["Up", "Down"])
             logger.warning(
-                f"Settlement fallback 50/50: pred={'yes' if pred else 'no'}, "
+                f"Settlement fallback 50/50 (all sources failed): "
                 f"cex=${cex_price:.2f}, strike=${strike:.2f}"
             )
+            # E8: Alert on coin-flip settlement
+            await self._alerter.check_coinflip_settlement(was_coinflip=True)
 
         await slot.strategy.on_round_end(market, settled)
 
-        # C3 FIX: Record per-round PnL delta, not cumulative
-        # P0.2 FIX: OracleArb manages its own PnL in on_round_end().
-        # The delta is already correct because both paths write to total_pnl_usd.
+        # Record per-round PnL delta, not cumulative
         round_pnl = slot.strategy.state.total_pnl_usd - slot.pnl_before_round
 
         self._ledger.record_round(
@@ -414,17 +497,37 @@ class VPSRunner:
             cex_price=cex_price,
         )
 
-        # Sync to risk manager
+        # Sync risk state after settlement
         total_daily = sum(s.strategy.state.daily_pnl_usd for s in self._slots)
         self._risk.state.daily_pnl = total_daily
         # Release per-asset exposure since positions are settled
         self._risk.release_exposure(market.asset, slot.round_cost)
+
+        # Clean up settlement snapshot
+        if hasattr(slot, '_settlement_cex_snapshot'):
+            slot._settlement_cex_snapshot = 0.0
+
+        # E4: Record round in analytics engine
+        was_fill = slot.round_fills > 0
+        direction = getattr(slot, '_trade_direction', slot.predicted_direction) or ""
+        # Try to get sniper's trade_direction
+        if hasattr(slot.strategy, '_trade_direction'):
+            direction = slot.strategy._trade_direction
+        self._analytics.record_round(
+            pnl=round_pnl,
+            was_fill=was_fill,
+            direction=direction,
+            confidence=getattr(slot.strategy, '_last_confidence', 0.0),
+            maker_price=getattr(slot.strategy, '_last_maker_price', 0.0),
+            order_size=slot.round_cost,
+        )
 
     async def _shutdown(self):
         await self._executor.cancel_all()
         await self._scanner.close()
         self._redis.stop()
         self._book_feed.stop()
+        await self._alerter.close()  # E8
 
         # Print per-strategy summary
         for slot in self._slots:
@@ -458,8 +561,8 @@ class VPSRunner:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Polymarket VPS Node")
-    parser.add_argument("-s", "--strategy", default="crypto_mm",
-                        help="Strategy name(s), comma-separated: crypto_mm,oracle_arb")
+    parser.add_argument("-s", "--strategy", default="sniper",
+                        help="Strategy name(s), comma-separated: sniper,crypto_mm")
     parser.add_argument("-m", "--mode", default="paper", choices=["paper", "live"])
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()

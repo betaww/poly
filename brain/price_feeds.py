@@ -11,8 +11,10 @@ faster than anyone else, using the RTX 5090.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import websockets
@@ -75,10 +77,16 @@ class BinanceFeed:
                         tick = PriceTick(
                             exchange="binance",
                             asset=asset,
-                            price=float(data.get("c", 0)),  # last price
+                            # P2 FIX: Use bid-ask midpoint instead of last trade
+                            price=(
+                                (float(data.get("b", 0)) + float(data.get("a", 0))) / 2
+                                if float(data.get("b", 0)) > 0 and float(data.get("a", 0)) > 0
+                                else float(data.get("c", 0))
+                            ),
                             bid=float(data.get("b", 0)),
                             ask=float(data.get("a", 0)),
-                            timestamp=time.time(),
+                            # P1 FIX: Use exchange event timestamp
+                            timestamp=data.get("E", int(time.time() * 1000)) / 1000.0,
                         )
                         self.last_price = tick.price
                         await callback(tick)
@@ -124,7 +132,12 @@ class CoinbaseFeed:
                         tick = PriceTick(
                             exchange="coinbase",
                             asset=asset,
-                            price=float(data.get("price", 0)),
+                            # P2 FIX: Use bid-ask midpoint
+                            price=(
+                                (float(data.get("best_bid", 0)) + float(data.get("best_ask", 0))) / 2
+                                if float(data.get("best_bid", 0)) > 0 and float(data.get("best_ask", 0)) > 0
+                                else float(data.get("price", 0))
+                            ),
                             bid=float(data.get("best_bid", 0)),
                             ask=float(data.get("best_ask", 0)),
                             timestamp=time.time(),
@@ -182,10 +195,16 @@ class OKXFeed:
                             tick = PriceTick(
                                 exchange="okx",
                                 asset=asset,
-                                price=float(item.get("last", 0)),
+                                # P2 FIX: Use bid-ask midpoint
+                                price=(
+                                    (float(item.get("bidPx", 0)) + float(item.get("askPx", 0))) / 2
+                                    if float(item.get("bidPx", 0)) > 0 and float(item.get("askPx", 0)) > 0
+                                    else float(item.get("last", 0))
+                                ),
                                 bid=float(item.get("bidPx", 0)),
                                 ask=float(item.get("askPx", 0)),
-                                timestamp=time.time(),
+                                # P1: OKX provides ms timestamp
+                                timestamp=int(item.get("ts", int(time.time() * 1000))) / 1000.0,
                             )
                             self.last_price = tick.price
                             await callback(tick)
@@ -213,12 +232,26 @@ class SyntheticOracle:
         self.weights = dict(config.oracle.weights)
         self.prices: dict[str, float] = {}
         self.update_times: dict[str, float] = {}
-        self._prediction_history: list[float] = []
+        self._prediction_history: deque = deque(maxlen=300)  # M8 FIX: bounded deque
+        # P5: Raw tick deque for accurate volatility calculation
+        self._raw_ticks: deque = deque(maxlen=500)
+        # P6: Per-exchange latency tracking
+        self._exchange_latencies: dict[str, deque] = {}
 
     def update(self, tick: PriceTick):
         """Process a new price tick."""
         self.prices[tick.exchange] = tick.price
         self.update_times[tick.exchange] = tick.timestamp
+        # P5: Store raw ticks for volatility
+        self._raw_ticks.append((tick.timestamp, tick.price))
+        # P6: Track observed latency (exchange timestamp vs local receipt)
+        local_now = time.time()
+        if tick.timestamp > 0 and tick.timestamp < local_now + 1:  # sanity check
+            latency_ms = (local_now - tick.timestamp) * 1000
+            if 0 < latency_ms < 5000:  # filter unreasonable values
+                if tick.exchange not in self._exchange_latencies:
+                    self._exchange_latencies[tick.exchange] = deque(maxlen=100)
+                self._exchange_latencies[tick.exchange].append(latency_ms)
 
     def predict(self) -> tuple[float, float]:
         """
@@ -229,20 +262,27 @@ class SyntheticOracle:
             return 0.0, 0.0
 
         # Weighted average of available prices
-        # BLIND SPOT FIX: normalize weights to sum=1.0 using only AVAILABLE exchanges
-        # Without this, if Kraken (15% weight) is down, total_weight < 1.0
-        # and the result is correct BUT confidence should reflect fewer sources
         total_weight = 0.0
         weighted_sum = 0.0
         available_count = 0
 
         for exchange, weight in self.weights.items():
             if exchange in self.prices:
-                # Staleness penalty: reduce weight if data is old
+                # P3 FIX: Exponential staleness decay (8s half-life)
+                # Linear was too aggressive: old code killed weight at 5s
                 age = time.time() - self.update_times.get(exchange, 0)
-                staleness_factor = max(0.1, 1.0 - age / 10.0)  # decay over 10s
+                staleness_factor = max(0.1, math.exp(-age * 0.693 / 8.0))  # ln(2)/8 ≈ 0.0866
 
-                effective_weight = weight * staleness_factor
+                # P6: Latency penalty — adjust weight for systematically slower exchanges
+                lat_dq = self._exchange_latencies.get(exchange)
+                if lat_dq and len(lat_dq) > 10:
+                    avg_latency = sum(lat_dq) / len(lat_dq)
+                    # Exchanges with >200ms extra latency get penalized
+                    latency_penalty = max(0.7, 1.0 - max(0, avg_latency - 100) / 500)
+                else:
+                    latency_penalty = 1.0
+
+                effective_weight = weight * staleness_factor * latency_penalty
                 weighted_sum += self.prices[exchange] * effective_weight
                 total_weight += effective_weight
                 available_count += 1
@@ -252,33 +292,56 @@ class SyntheticOracle:
 
         predicted = weighted_sum / total_weight
 
-        # Confidence based on source agreement
+        # P4 FIX: Use MAD (Median Absolute Deviation) instead of max_deviation
+        # MAD is robust to single outlier exchanges (e.g., OKX flash crash)
         if len(self.prices) >= 2:
             prices = list(self.prices.values())
             median = sorted(prices)[len(prices) // 2]
-            max_deviation = max(abs(p - median) / median for p in prices) if median > 0 else 0
-            # M3 FIX: multiplier was 100 (way too aggressive — 0.01% diff killed confidence)
-            # Changed to 10: 0.1% deviation → confidence 0.99, 1% → 0.90
-            confidence = max(0.5, 1.0 - max_deviation * 10)
-            # BLIND SPOT FIX: fewer sources = lower confidence
+            if median > 0:
+                deviations = sorted(abs(p - median) / median for p in prices)
+                mad = deviations[len(deviations) // 2]  # median of absolute deviations
+                # 0.1% MAD → conf ~0.98, 0.5% MAD → conf ~0.90
+                confidence = max(0.5, 1.0 - mad * 20)
+            else:
+                confidence = 0.5
+            # Source penalty: fewer sources = lower confidence
             expected_sources = len(self.weights)
             source_penalty = available_count / max(expected_sources, 1)
-            confidence *= source_penalty  # e.g., 2/4 sources → 50% penalty
+            confidence *= source_penalty
             confidence = max(0.5, confidence)
         else:
             confidence = 0.6  # single source = lower confidence
 
         self._prediction_history.append(predicted)
-        if len(self._prediction_history) > 300:
-            self._prediction_history = self._prediction_history[-300:]
 
         return predicted, min(confidence, 0.99)
 
     def get_volatility(self) -> float:
-        """Calculate rolling volatility from prediction history."""
+        """P5 FIX: Calculate volatility from RAW ticks, not smoothed predictions.
+
+        Using raw ticks gives a more accurate picture of actual market volatility,
+        since the weighted average prediction smooths out exchange-to-exchange noise.
+        """
+        # P5: Use raw ticks if available
+        if len(self._raw_ticks) >= 10:
+            recent = list(self._raw_ticks)[-60:]
+            if len(recent) >= 2:
+                prices_only = [p for _, p in recent]
+                mean = sum(prices_only) / len(prices_only)
+                if mean > 0:
+                    returns = [
+                        (prices_only[i] - prices_only[i-1]) / prices_only[i-1]
+                        for i in range(1, len(prices_only))
+                        if prices_only[i-1] != 0
+                    ]
+                    if returns:
+                        variance = sum(r**2 for r in returns) / len(returns)
+                        return max(0.001, variance ** 0.5)
+
+        # Fallback: use prediction history
         if len(self._prediction_history) < 10:
             return 0.01
-        recent = self._prediction_history[-60:]
+        recent = list(self._prediction_history)[-60:]
         if len(recent) < 2:
             return 0.01
         mean = sum(recent) / len(recent)

@@ -56,15 +56,27 @@ class FeedForwarder:
         logger.info("FeedForwarder started: 6 feeds (Binance+OKX+Coinbase × BTC+ETH)")
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _publish_tick(self, exchange: str, asset: str, price: float, bid: float, ask: float):
-        """Publish a price tick to Redis with auto-reconnect."""
+    def _publish_tick(self, exchange: str, asset: str, price: float, bid: float, ask: float,
+                       exchange_ts: float = 0.0):
+        """Publish a price tick to Redis with auto-reconnect.
+
+        P2 FIX: Use bid-ask midpoint as primary price when both are available.
+        P1 FIX: Preserve exchange event timestamp for accurate staleness.
+        """
+        # P2: Prefer bid-ask midpoint over last trade
+        if bid > 0 and ask > 0:
+            midpoint = (bid + ask) / 2
+        else:
+            midpoint = price  # fallback to last trade
+
         tick = {
             "exchange": exchange,
             "asset": asset,
-            "price": price,
+            "price": midpoint,  # P2: midpoint instead of last trade
             "bid": bid,
             "ask": ask,
-            "ts": time.time(),
+            "ts": exchange_ts if exchange_ts > 0 else time.time(),  # P1: exchange timestamp
+            "local_ts": time.time(),  # local receipt time for latency measurement
         }
         # Track for heartbeat
         key = f"{exchange}:{asset}"
@@ -110,11 +122,14 @@ class FeedForwarder:
                         if not self._running:
                             break
                         d = json.loads(msg)
+                        # P1: Use Binance event time (ms epoch)
+                        exchange_ts = d.get("E", 0) / 1000.0 if d.get("E") else 0.0
                         self._publish_tick(
                             "binance", asset,
                             float(d.get("c", 0)),
                             float(d.get("b", 0)),
                             float(d.get("a", 0)),
+                            exchange_ts=exchange_ts,
                         )
             except Exception as e:
                 logger.error(f"[VPS] Binance {symbol}: {e}")
@@ -138,11 +153,14 @@ class FeedForwarder:
                         if "data" not in d:
                             continue
                         for item in d["data"]:
+                            # P1: OKX ts is ms epoch
+                            exchange_ts = int(item.get("ts", 0)) / 1000.0 if item.get("ts") else 0.0
                             self._publish_tick(
                                 "okx", asset,
                                 float(item.get("last", 0)),
                                 float(item.get("bidPx", 0)),
                                 float(item.get("askPx", 0)),
+                                exchange_ts=exchange_ts,
                             )
             except Exception as e:
                 logger.error(f"[VPS] OKX {inst_id}: {e}")
@@ -165,11 +183,22 @@ class FeedForwarder:
                         d = json.loads(msg)
                         if d.get("type") != "ticker":
                             continue
+                        # P1: Coinbase provides ISO time, convert to epoch
+                        cb_time = d.get("time", "")
+                        exchange_ts = 0.0
+                        if cb_time:
+                            try:
+                                from datetime import datetime, timezone
+                                dt = datetime.fromisoformat(cb_time.replace('Z', '+00:00'))
+                                exchange_ts = dt.timestamp()
+                            except (ValueError, TypeError):
+                                pass
                         self._publish_tick(
                             "coinbase", asset,
                             float(d.get("price", 0)),
                             float(d.get("best_bid", 0)),
                             float(d.get("best_ask", 0)),
+                            exchange_ts=exchange_ts,
                         )
             except Exception as e:
                 logger.error(f"[VPS] Coinbase {product_id}: {e}")

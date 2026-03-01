@@ -31,7 +31,10 @@ class Prediction:
 
     @property
     def is_stale(self) -> bool:
-        return self.age_ms > 5000  # stale after 5 seconds
+        # C8 FIX: 5s was too aggressive — minor network hiccups would
+        # drop predictions during the critical T-10s commitment window.
+        # In a 5-min round, even a 15s-old BTC price is highly informative.
+        return self.age_ms > 15000  # stale after 15 seconds
 
 
 class RedisConsumer:

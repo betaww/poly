@@ -8,6 +8,8 @@ Wraps the official Polymarket Python SDK for:
   - Balance queries
 
 Paper mode: logs orders without submitting to CLOB.
+E3: Paper sim uses real CLOB depth when available.
+E5: Live mode uses WebSocket fill tracker when available.
 """
 import logging
 import time
@@ -74,6 +76,11 @@ class OrderExecutor:
         else:
             self._init_clob_client()
 
+        # E3: Optional CLOB book feed reference for real depth data
+        self._clob_feed = None
+        # E5: Optional live fill tracker
+        self._live_fill_tracker = None
+
     def _init_clob_client(self):
         """Initialize the official py-clob-client."""
         try:
@@ -125,8 +132,24 @@ class OrderExecutor:
     def _paper_fill(self, record: OrderRecord) -> OrderRecord:
         """Simulate fill using realistic PaperSimulator."""
         signal = record.signal
+        # C4 FIX: Use the market's current midpoint which is now updated
+        # in real-time from CLOB book feed (see vps_runner C3 fix).
+        # Falls back to price_up if book feed is unavailable.
         midpoint = signal.market.midpoint
         is_buy = signal.side == Side.BUY
+
+        # E3: Use real CLOB depth to dynamically adjust book model
+        if self._clob_feed:
+            token_id = signal.token_id
+            book = self._clob_feed.get_book(token_id)
+            if book and book.total_bid_depth_usd > 0:
+                # Override parameterized depth with real CLOB depth
+                real_depth = book.total_bid_depth_usd if is_buy else book.total_ask_depth_usd
+                if real_depth > 0:
+                    self._simulator.book.total_depth_usd = real_depth
+                    # Also use real midpoint
+                    if book.midpoint > 0:
+                        midpoint = book.midpoint
 
         if signal.order_type == "FOK":
             # Taker order: slippage + fees + latency
@@ -138,10 +161,11 @@ class OrderExecutor:
             )
         else:
             # Maker order: probabilistic fill, 0% fee
-            # P1.4 FIX: resting_time = how long our GTC order sits on the book.
-            # We place a new order each 1s cycle, so realistic resting is ~3-5s.
-            # Using seconds_remaining (up to 300s) was way too generous.
-            resting_time = 5.0  # realistic: order rests ~5 seconds before next cycle
+            # M1 FIX: For DirectionalSniper, the GTC order rests from
+            # signal time until blackout window (T-5s) or round end.
+            # Use actual seconds_remaining as upper bound, minus 5s blackout.
+            remaining = signal.market.seconds_remaining
+            resting_time = max(1.0, min(remaining - 5.0, 10.0))  # 1-10s realistic range
             # Use config volatility if available, fallback to 5%
             vol = getattr(self.config, 'paper_sim', None)
             default_vol = vol.default_volatility if vol else 0.05
@@ -222,7 +246,13 @@ class OrderExecutor:
                 )
                 tick_size = signal.market.tick_size
                 neg_risk = signal.market.neg_risk
-                signed_order = self._clob_client.create_order(order_args)
+                # C7 FIX: pass tick_size and neg_risk to create_order
+                # for correct EIP-712 signature. Without these, live
+                # orders may be rejected with "invalid signature".
+                signed_order = self._clob_client.create_order(
+                    order_args,
+                    options={"tick_size": tick_size, "neg_risk": neg_risk},
+                )
                 resp = self._clob_client.post_order(
                     signed_order,
                     OrderType.GTC,

@@ -49,8 +49,8 @@ class APIConfig:
 class MarketConfig:
     """Market scanning parameters."""
     # Assets to trade
-    assets: list[str] = field(default_factory=lambda: ["btc", "eth"])
-    # Timeframe: 5m, 15m, 1h, 4h
+    assets: list = field(default_factory=lambda: ["btc", "eth"])  # E7: multi-asset
+    timeframes: list = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     timeframe: str = "5m"
     # Slug patterns per timeframe
     SLUG_PATTERNS: dict = field(default_factory=lambda: {
@@ -84,6 +84,10 @@ class StrategyConfig:
     sniper_min_confidence: float = 0.65  # minimum confidence to fire
     sniper_window_start: int = 10      # T-10s start committing
     sniper_window_end: int = 5         # T-5s stop (maker needs fill time)
+    # E2: Kelly sizing parameters
+    sniper_bankroll: float = 100.0     # starting bankroll for Kelly sizing
+    sniper_min_size: float = 5.0       # minimum order size USD
+    sniper_max_kelly_fraction: float = 0.15  # max fraction of bankroll per trade
 
     # --- Oracle Arbitrage (legacy, kept for reference) ---
     oracle_confidence_threshold: float = 0.95  # min confidence to trade
@@ -121,14 +125,13 @@ class OracleConfig:
     """Synthetic oracle configuration."""
     # Exchange weights for price aggregation
     weights: dict = field(default_factory=lambda: {
-        # Only include exchanges we actually have feeds for
-        # Kraken removed: no feed → permanently missing → confidence penalty
-        "binance": 0.50,     # was 0.45, absorbed kraken share
+        "binance": 0.50,
         "coinbase": 0.30,
-        "okx": 0.20,         # was 0.10, absorbed kraken share
+        "okx": 0.20,
     })
     # CEX WebSocket endpoints
     binance_ws: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+    binance_ws_eth: str = "wss://stream.binance.com:9443/ws/ethusdt@ticker"  # E7
     coinbase_ws: str = "wss://ws-feed.exchange.coinbase.com"
     # Outlier rejection threshold
     outlier_threshold_pct: float = 0.002  # 0.2%
@@ -159,6 +162,30 @@ class RedisConfig:
 
 
 @dataclass
+class AlertConfig:
+    """E8: Telegram alerting configuration."""
+    enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    # Alert thresholds
+    brain_offline_seconds: int = 30
+    consecutive_coinflip_alert: int = 3
+    clob_disconnect_seconds: int = 60
+    fill_rate_min: float = 0.10  # alert if fill rate drops below 10%
+    fill_rate_max: float = 0.80  # alert if fill rate exceeds 80% (unrealistic)
+
+    @classmethod
+    def from_env(cls) -> "AlertConfig":
+        token = os.environ.get("POLY_TELEGRAM_TOKEN", "")
+        chat_id = os.environ.get("POLY_TELEGRAM_CHAT_ID", "")
+        return cls(
+            enabled=bool(token and chat_id),
+            telegram_bot_token=token,
+            telegram_chat_id=chat_id,
+        )
+
+
+@dataclass
 class Config:
     """Master configuration."""
     wallet: WalletConfig = field(default_factory=WalletConfig)
@@ -168,6 +195,7 @@ class Config:
     paper_sim: PaperSimConfig = field(default_factory=PaperSimConfig)
     oracle: OracleConfig = field(default_factory=OracleConfig)
     redis: RedisConfig = field(default_factory=RedisConfig)
+    alert: AlertConfig = field(default_factory=AlertConfig)  # E8
 
     # Operating mode
     mode: str = "paper"  # "paper" or "live"
@@ -181,6 +209,7 @@ class Config:
             wallet=WalletConfig.from_env(),
             api=APIConfig.from_env(),
             redis=RedisConfig.from_env(),
+            alert=AlertConfig.from_env(),  # E8
             mode=os.environ.get("POLYMARKET_MODE", "paper"),
             node=os.environ.get("POLY_NODE", "standalone"),
         )

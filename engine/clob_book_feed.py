@@ -18,6 +18,7 @@ Used by:
 import asyncio
 import json
 import logging
+import queue
 import time
 import threading
 from dataclasses import dataclass, field
@@ -116,7 +117,7 @@ class CLOBBookFeed:
         self._thread: threading.Thread | None = None
         self._token_info: dict[str, tuple[str, str]] = {}  # token_id → (asset, outcome)
         self._ws_connected = False
-        self._pending_subs: list[str] = []  # tokens to subscribe on next loop
+        self._pending_subs: queue.Queue = queue.Queue()  # M5 FIX: thread-safe queue
 
     def start(self, token_ids: dict[str, tuple[str, str]]):
         """
@@ -151,7 +152,7 @@ class CLOBBookFeed:
             self._books[token_id] = OrderBookSnapshot(
                 token_id=token_id, asset=asset, outcome=outcome
             )
-        self._pending_subs.append(token_id)
+        self._pending_subs.put(token_id)  # M5 FIX: thread-safe
         logger.info(f"CLOB BookFeed: queued subscription for {asset}_{outcome} {token_id[:16]}...")
 
     def _run_loop(self):
@@ -182,16 +183,19 @@ class CLOBBookFeed:
                     async for msg in ws:
                         if not self._running:
                             break
-                        # Process any pending late subscriptions
-                        while self._pending_subs:
-                            tid = self._pending_subs.pop(0)
-                            sub_msg = {
-                                "type": "subscribe",
-                                "channel": "book",
-                                "assets_id": tid,
-                            }
-                            await ws.send(json.dumps(sub_msg))
-                            logger.info(f"Late-subscribed to book: {tid[:16]}...")
+                        # M5 FIX: Process pending late subscriptions (thread-safe)
+                        while not self._pending_subs.empty():
+                            try:
+                                tid = self._pending_subs.get_nowait()
+                                sub_msg = {
+                                    "type": "subscribe",
+                                    "channel": "book",
+                                    "assets_id": tid,
+                                }
+                                await ws.send(json.dumps(sub_msg))
+                                logger.info(f"Late-subscribed to book: {tid[:16]}...")
+                            except queue.Empty:
+                                break
                         try:
                             self._process_message(json.loads(msg))
                         except json.JSONDecodeError:

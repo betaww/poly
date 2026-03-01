@@ -14,9 +14,13 @@ import json
 import sys
 import os
 
-# L7 FIX: Use relative path from this file instead of hardcoding /opt
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-from polymarket.engine.trade_ledger import TradeLedger
+# L4 FIX: Use relative import when run as module (-m polymarket.engine.report).
+# Fallback to sys.path for direct script execution.
+try:
+    from ..engine.trade_ledger import TradeLedger
+except ImportError:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    from polymarket.engine.trade_ledger import TradeLedger
 
 
 def print_report(stats: dict):
