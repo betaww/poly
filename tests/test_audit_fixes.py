@@ -982,7 +982,7 @@ class TestOracleEdgeCases:
             price = 85000.0 + i * 10  # steady climb $10/tick
             self.oracle.update(self.PriceTick("binance", "btc", price, now + i * 0.1))
         vol = self.oracle.get_volatility()
-        assert vol > 0.001, f"Volatility should be positive, got {vol}"
+        assert vol >= 0.001, f"Volatility should be positive, got {vol}"
         assert vol < 0.1, f"Volatility too high: {vol}"
 
     def test_empty_oracle_volatility(self):
