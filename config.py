@@ -123,11 +123,15 @@ class PaperSimConfig:
 @dataclass
 class OracleConfig:
     """Synthetic oracle configuration."""
-    # Exchange weights for price aggregation
+    # Exchange/oracle weights for price aggregation
+    # Pyth: highest weight — pull-based like Chainlink, >0.999 correlation
+    # Chainlink: 0.0 weight — used only for drift calibration, not pricing
     weights: dict = field(default_factory=lambda: {
-        "binance": 0.50,
-        "coinbase": 0.30,
-        "okx": 0.20,
+        "pyth": 0.40,       # Pull-based oracle, closest to Chainlink Data Streams
+        "binance": 0.30,    # Highest volume CEX
+        "coinbase": 0.15,   # US regulated, reliable
+        "okx": 0.15,        # Asian market coverage
+        "chainlink": 0.0,   # Calibration only — not used in pricing
     })
     # CEX WebSocket endpoints
     binance_ws: str = "wss://stream.binance.com:9443/ws/btcusdt@ticker"

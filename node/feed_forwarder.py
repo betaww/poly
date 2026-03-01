@@ -1,12 +1,17 @@
 """
-VPS Feed Forwarder — runs exchange WebSocket feeds and publishes to Redis.
+VPS Feed Forwarder — runs exchange + oracle WebSocket feeds and publishes to Redis.
 
 Runs on VPS (London) where all exchanges are accessible.
 Alienware Brain reads these prices from Redis instead of connecting directly.
 
 Architecture:
-  VPS: Binance WS + OKX WS + Coinbase WS → Redis pub/sub
+  VPS: Binance WS + OKX WS + Coinbase WS + Pyth WS + Chainlink Poll → Redis pub/sub
   Alienware: Redis sub → SyntheticOracle → Redis pub (predictions)
+
+Data sources:
+  - Binance, OKX, Coinbase: Direct CEX WebSocket (P1/P2 enriched)
+  - Pyth Network (Hermes): Pull-based oracle, 400ms refresh, >0.999 correlation with Chainlink
+  - Chainlink (Polygon): On-chain Price Feed poll, 0.1% deviation / 25s heartbeat (calibration only)
 """
 import asyncio
 import json
@@ -42,6 +47,19 @@ class FeedForwarder:
             password=self._redis_password, decode_responses=True,
         )
 
+    # Pyth Hermes feed IDs (stable, hex-encoded)
+    PYTH_FEEDS = {
+        "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43": "btc",
+        "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace": "eth",
+    }
+    # Chainlink Polygon mainnet Price Feed proxy contracts
+    CHAINLINK_FEEDS = {
+        "btc": "0xc907A4bc44122d645e9981358C895a9B48977F6f",
+        "eth": "0xF96825BFe640c313c0A5F90B2E15a0c863C55945",
+    }
+    # AggregatorV3Interface.latestRoundData() ABI (only what we need)
+    AGGREGATOR_ABI = [{"inputs":[], "name":"latestRoundData", "outputs":[{"name":"roundId","type":"uint80"},{"name":"answer","type":"int256"},{"name":"startedAt","type":"uint256"},{"name":"updatedAt","type":"uint256"},{"name":"answeredInRound","type":"uint80"}], "stateMutability":"view", "type":"function"}]
+
     async def start(self):
         self._running = True
         tasks = [
@@ -51,9 +69,14 @@ class FeedForwarder:
             asyncio.create_task(self._okx_feed("ETH-USDT", "eth")),
             asyncio.create_task(self._coinbase_feed("BTC-USD", "btc")),
             asyncio.create_task(self._coinbase_feed("ETH-USD", "eth")),
+            asyncio.create_task(self._pyth_feed()),
+            asyncio.create_task(self._chainlink_poller()),
             asyncio.create_task(self._heartbeat_loop()),
         ]
-        logger.info("FeedForwarder started: 6 feeds (Binance+OKX+Coinbase × BTC+ETH)")
+        logger.info(
+            "FeedForwarder started: 8 feeds "
+            "(Binance+OKX+Coinbase+Pyth+Chainlink × BTC+ETH)"
+        )
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def _publish_tick(self, exchange: str, asset: str, price: float, bid: float, ask: float,
@@ -204,6 +227,128 @@ class FeedForwarder:
                 logger.error(f"[VPS] Coinbase {product_id}: {e}")
             if self._running:
                 await asyncio.sleep(2)
+
+    # ─── Pyth Network (Hermes SSE) ────────────────────────────
+
+    async def _pyth_feed(self):
+        """Connect to Pyth Hermes SSE for BTC + ETH prices.
+
+        Pyth uses pull-based architecture matching Chainlink Data Streams.
+        400ms refresh, free public API, >0.999 correlation with Chainlink.
+        Uses Server-Sent Events (SSE) via HTTP for maximum compatibility.
+        """
+        feed_ids = list(self.PYTH_FEEDS.keys())
+        ids_param = "&ids[]=".join(feed_ids)
+        url = f"https://hermes.pyth.network/v2/updates/price/stream?ids[]={ids_param}&parsed=true"
+
+        while self._running:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        logger.info(f"[VPS] Pyth Hermes SSE connected ({len(feed_ids)} feeds)")
+                        buffer = ""
+                        async for chunk in resp.content:
+                            if not self._running:
+                                break
+                            buffer += chunk.decode("utf-8", errors="ignore")
+                            # SSE messages are separated by double newlines
+                            while "\n\n" in buffer:
+                                event_str, buffer = buffer.split("\n\n", 1)
+                                self._process_pyth_event(event_str)
+            except ImportError:
+                logger.warning("[VPS] Pyth feed: aiohttp not installed. pip install aiohttp")
+                await asyncio.sleep(300)  # don't spam
+            except Exception as e:
+                logger.error(f"[VPS] Pyth Hermes: {e}")
+            if self._running:
+                await asyncio.sleep(3)
+
+    def _process_pyth_event(self, event_str: str):
+        """Parse Pyth SSE event and publish ticks."""
+        # SSE format: "data: {json}\n"
+        for line in event_str.strip().split("\n"):
+            if line.startswith("data:"):
+                try:
+                    data = json.loads(line[5:].strip())
+                    parsed = data.get("parsed", [])
+                    for feed in parsed:
+                        feed_id = feed.get("id", "")
+                        asset = self.PYTH_FEEDS.get(feed_id)
+                        if not asset:
+                            continue
+                        price_data = feed.get("price", {})
+                        if not price_data:
+                            continue
+                        # Pyth price is integer with exponent (e.g. price=8500000, expo=-2 → $85000.00)
+                        raw_price = int(price_data.get("price", 0))
+                        expo = int(price_data.get("expo", 0))
+                        price = raw_price * (10 ** expo)
+                        publish_time = int(price_data.get("publish_time", 0))
+                        # Pyth confidence interval (same scale)
+                        raw_conf = int(price_data.get("conf", 0))
+                        conf = raw_conf * (10 ** expo)
+                        # Use conf as synthetic bid/ask spread
+                        bid = price - conf
+                        ask = price + conf
+                        if price > 0:
+                            self._publish_tick(
+                                "pyth", asset, price, bid, ask,
+                                exchange_ts=float(publish_time),
+                            )
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    pass
+
+    # ─── Chainlink Polygon On-Chain ──────────────────────────
+
+    async def _chainlink_poller(self):
+        """Poll Chainlink Price Feeds on Polygon mainnet every 10s.
+
+        Used as calibration reference for drift detection.
+        BTC/USD: 0.1% deviation threshold, ~25s heartbeat.
+        NOT used as a trading signal — only for Oracle drift monitoring.
+        """
+        rpc_url = os.environ.get(
+            "POLYGON_RPC_URL",
+            "https://polygon-rpc.com",  # free public RPC
+        )
+        while self._running:
+            try:
+                from web3 import Web3
+                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                if not w3.is_connected():
+                    logger.warning("[VPS] Chainlink: Polygon RPC not connected")
+                    await asyncio.sleep(30)
+                    continue
+                logger.info(f"[VPS] Chainlink Polygon poller started (10s interval)")
+                while self._running:
+                    for asset, addr in self.CHAINLINK_FEEDS.items():
+                        try:
+                            contract = w3.eth.contract(
+                                address=Web3.to_checksum_address(addr),
+                                abi=self.AGGREGATOR_ABI,
+                            )
+                            result = contract.functions.latestRoundData().call()
+                            # result = (roundId, answer, startedAt, updatedAt, answeredInRound)
+                            answer = result[1]
+                            updated_at = result[3]
+                            # Chainlink USD feeds use 8 decimals
+                            price = answer / 1e8
+                            if price > 0:
+                                self._publish_tick(
+                                    "chainlink", asset, price, 0.0, 0.0,
+                                    exchange_ts=float(updated_at),
+                                )
+                        except Exception as e:
+                            logger.debug(f"[VPS] Chainlink {asset}: {e}")
+                    await asyncio.sleep(10)
+            except ImportError:
+                logger.warning("[VPS] Chainlink poller: web3 not installed. pip install web3")
+                await asyncio.sleep(300)  # don't spam
+            except Exception as e:
+                logger.error(f"[VPS] Chainlink poller: {e}")
+            if self._running:
+                await asyncio.sleep(10)
 
     def stop(self):
         self._running = False

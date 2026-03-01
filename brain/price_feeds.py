@@ -221,10 +221,14 @@ class OKXFeed:
 
 class SyntheticOracle:
     """
-    Weighted price aggregator that mimics Chainlink Data Streams.
+    Weighted median price aggregator aligned with Chainlink Data Streams.
 
-    Produces a synthetic settlement price prediction by combining
-    multiple exchange feeds with adaptive weights.
+    Chainlink uses 3-layer median-of-medians aggregation. We replicate this
+    by computing a weighted median across Pyth (pull-based oracle, closest
+    to Chainlink), plus 3 CEX feeds with staleness/latency adjustments.
+
+    Chainlink on-chain price is used ONLY for drift detection calibration
+    (weight=0), not for pricing.
     """
 
     def __init__(self, config: Config):
@@ -237,13 +241,21 @@ class SyntheticOracle:
         self._raw_ticks: deque = deque(maxlen=500)
         # P6: Per-exchange latency tracking
         self._exchange_latencies: dict[str, deque] = {}
+        # Chainlink drift detection
+        self._chainlink_price: float = 0.0
+        self._chainlink_updated_at: float = 0.0
 
     def update(self, tick: PriceTick):
         """Process a new price tick."""
+        # Track Chainlink price separately for drift detection
+        if tick.exchange == "chainlink":
+            self._chainlink_price = tick.price
+            self._chainlink_updated_at = tick.timestamp
         self.prices[tick.exchange] = tick.price
         self.update_times[tick.exchange] = tick.timestamp
-        # P5: Store raw ticks for volatility
-        self._raw_ticks.append((tick.timestamp, tick.price))
+        # P5: Store raw ticks for volatility (exclude chainlink — too slow)
+        if tick.exchange != "chainlink":
+            self._raw_ticks.append((tick.timestamp, tick.price))
         # P6: Track observed latency (exchange timestamp vs local receipt)
         local_now = time.time()
         if tick.timestamp > 0 and tick.timestamp < local_now + 1:  # sanity check
@@ -253,64 +265,99 @@ class SyntheticOracle:
                     self._exchange_latencies[tick.exchange] = deque(maxlen=100)
                 self._exchange_latencies[tick.exchange].append(latency_ms)
 
+    def _weighted_median(self, prices_weights: list[tuple[float, float]]) -> float:
+        """Compute weighted median — matches Chainlink's median-of-medians logic.
+
+        Args:
+            prices_weights: list of (price, effective_weight) tuples
+
+        Returns:
+            The weighted median price.
+        """
+        if not prices_weights:
+            return 0.0
+        # Sort by price
+        pw = sorted(prices_weights, key=lambda x: x[0])
+        total = sum(w for _, w in pw)
+        if total == 0:
+            return 0.0
+        cumulative = 0.0
+        for price, weight in pw:
+            cumulative += weight
+            if cumulative >= total / 2:
+                return price
+        return pw[-1][0]  # fallback: last price
+
     def predict(self) -> tuple[float, float]:
         """
         Generate synthetic Chainlink settlement price prediction.
+        Uses WEIGHTED MEDIAN (matching Chainlink's median-of-medians algorithm).
         Returns (predicted_price, confidence).
         """
         if not self.prices:
             return 0.0, 0.0
 
-        # Weighted average of available prices
-        total_weight = 0.0
-        weighted_sum = 0.0
+        # Build list of (price, effective_weight) for active sources
+        prices_weights: list[tuple[float, float]] = []
         available_count = 0
 
         for exchange, weight in self.weights.items():
-            if exchange in self.prices:
+            if exchange in self.prices and weight > 0:
                 # P3 FIX: Exponential staleness decay (8s half-life)
-                # Linear was too aggressive: old code killed weight at 5s
                 age = time.time() - self.update_times.get(exchange, 0)
-                staleness_factor = max(0.1, math.exp(-age * 0.693 / 8.0))  # ln(2)/8 ≈ 0.0866
+                staleness_factor = max(0.1, math.exp(-age * 0.693 / 8.0))
 
                 # P6: Latency penalty — adjust weight for systematically slower exchanges
                 lat_dq = self._exchange_latencies.get(exchange)
                 if lat_dq and len(lat_dq) > 10:
                     avg_latency = sum(lat_dq) / len(lat_dq)
-                    # Exchanges with >200ms extra latency get penalized
                     latency_penalty = max(0.7, 1.0 - max(0, avg_latency - 100) / 500)
                 else:
                     latency_penalty = 1.0
 
                 effective_weight = weight * staleness_factor * latency_penalty
-                weighted_sum += self.prices[exchange] * effective_weight
-                total_weight += effective_weight
+                prices_weights.append((self.prices[exchange], effective_weight))
                 available_count += 1
 
-        if total_weight == 0:
+        if not prices_weights:
             return 0.0, 0.0
 
-        predicted = weighted_sum / total_weight
+        # WEIGHTED MEDIAN — matches Chainlink's aggregation algorithm
+        predicted = self._weighted_median(prices_weights)
 
-        # P4 FIX: Use MAD (Median Absolute Deviation) instead of max_deviation
-        # MAD is robust to single outlier exchanges (e.g., OKX flash crash)
-        if len(self.prices) >= 2:
-            prices = list(self.prices.values())
-            median = sorted(prices)[len(prices) // 2]
+        # P4 FIX: Use MAD (Median Absolute Deviation) for confidence
+        active_prices = [p for p, _ in prices_weights]
+        if len(active_prices) >= 2:
+            sorted_prices = sorted(active_prices)
+            median = sorted_prices[len(sorted_prices) // 2]
             if median > 0:
-                deviations = sorted(abs(p - median) / median for p in prices)
-                mad = deviations[len(deviations) // 2]  # median of absolute deviations
-                # 0.1% MAD → conf ~0.98, 0.5% MAD → conf ~0.90
+                deviations = sorted(abs(p - median) / median for p in active_prices)
+                mad = deviations[len(deviations) // 2]
                 confidence = max(0.5, 1.0 - mad * 20)
             else:
                 confidence = 0.5
-            # Source penalty: fewer sources = lower confidence
-            expected_sources = len(self.weights)
+            # Source penalty: fewer active sources = lower confidence
+            expected_sources = sum(1 for w in self.weights.values() if w > 0)
             source_penalty = available_count / max(expected_sources, 1)
             confidence *= source_penalty
             confidence = max(0.5, confidence)
         else:
-            confidence = 0.6  # single source = lower confidence
+            confidence = 0.6
+
+        # Chainlink drift detection — reduce confidence when we diverge from settlement source
+        chainlink_age = time.time() - self._chainlink_updated_at
+        if self._chainlink_price > 0 and chainlink_age < 60 and predicted > 0:
+            drift = abs(predicted - self._chainlink_price) / self._chainlink_price
+            if drift > 0.001:  # > 0.1% drift
+                # 0.1% drift → -5% conf, 0.5% drift → -25% conf
+                drift_penalty = min(0.30, drift * 50)
+                confidence *= (1.0 - drift_penalty)
+                confidence = max(0.5, confidence)
+                logger.info(
+                    f"Chainlink drift: {drift:.4%} | "
+                    f"ours=${predicted:.2f} vs CL=${self._chainlink_price:.2f} | "
+                    f"conf penalty={drift_penalty:.1%}"
+                )
 
         self._prediction_history.append(predicted)
 
