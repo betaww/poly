@@ -138,10 +138,10 @@ class OrderExecutor:
             )
         else:
             # Maker order: probabilistic fill, 0% fee
-            # FIX: Use actual time remaining, not hardcoded 60s
-            # OracleArb enters at T-10s, CryptoMM T-10s directional both need short resting
-            t_remaining = getattr(signal.market, 'seconds_remaining', 60.0)
-            resting_time = max(3.0, min(t_remaining, 60.0))  # clamp to 3-60s
+            # P1.4 FIX: resting_time = how long our GTC order sits on the book.
+            # We place a new order each 1s cycle, so realistic resting is ~3-5s.
+            # Using seconds_remaining (up to 300s) was way too generous.
+            resting_time = 5.0  # realistic: order rests ~5 seconds before next cycle
             # Use config volatility if available, fallback to 5%
             vol = getattr(self.config, 'paper_sim', None)
             default_vol = vol.default_volatility if vol else 0.05

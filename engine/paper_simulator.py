@@ -130,8 +130,8 @@ def simulate_price_drift(price: float, latency_s: float,
 @dataclass
 class OrderBookConfig:
     """Simulated order book parameters."""
-    # Total depth per side (USD)
-    total_depth_usd: float = 10000.0   # $10K per side (mid-range estimate)
+    # Total depth per side (USD) — synced with config.py PaperSimConfig
+    total_depth_usd: float = 2000.0    # $2K per side (real 5-min markets: $500-5K)
     # Depth concentration: fraction of depth within 1 tick of midpoint
     near_concentration: float = 0.3     # 30% depth within 1 tick
     # Number of price levels modeled

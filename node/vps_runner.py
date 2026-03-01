@@ -17,6 +17,7 @@ Usage:
 """
 import asyncio
 import logging
+import random
 import signal
 import time
 from datetime import datetime, timezone
@@ -238,20 +239,18 @@ class VPSRunner:
         if not best_markets:
             return
 
-        # Run each strategy on its assigned asset's market
-        # Each slot tracks one market at a time via current_market.
-        # With N slots and M assets, distribute: slot[i] gets asset[i % M]
-        assets = self.config.market.assets
-        for i, slot in enumerate(self._slots):
-            asset = assets[i % len(assets)] if assets else None
-            if not asset:
-                continue
-            market = best_markets.get(asset)
-            if not market:
-                # Fallback: try any available market
-                market = next(iter(best_markets.values()), None)
-            if market:
-                await self._run_strategy_on_market(slot, market)
+        # P1.5 FIX: All strategies trade the PRIMARY asset (highest liquidity).
+        # Previously split by index (slot[0]=btc, slot[1]=eth) which misassigned OracleArb.
+        primary_asset = self.config.market.assets[0] if self.config.market.assets else None
+        if not primary_asset:
+            return
+        market = best_markets.get(primary_asset)
+        if not market:
+            market = next(iter(best_markets.values()), None)
+        if not market:
+            return
+        for slot in self._slots:
+            await self._run_strategy_on_market(slot, market)
 
         # Publish telemetry
         self._publish_telemetry()
@@ -387,8 +386,7 @@ class VPSRunner:
             settled = "Up" if cex_price > strike else "Down"
             logger.info(f"Settlement: CEX=${cex_price:.2f} vs strike=${strike:.2f} → {settled}")
         else:
-            # Last resort: 50/50 coin flip
-            import random
+            # Last resort: 50/50 coin flip (P2.6: random imported at top)
             settled = random.choice(["Up", "Down"])
             logger.warning(
                 f"Settlement fallback 50/50: pred={'yes' if pred else 'no'}, "
@@ -398,6 +396,8 @@ class VPSRunner:
         await slot.strategy.on_round_end(market, settled)
 
         # C3 FIX: Record per-round PnL delta, not cumulative
+        # P0.2 FIX: OracleArb manages its own PnL in on_round_end().
+        # The delta is already correct because both paths write to total_pnl_usd.
         round_pnl = slot.strategy.state.total_pnl_usd - slot.pnl_before_round
 
         self._ledger.record_round(

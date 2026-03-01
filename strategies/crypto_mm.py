@@ -183,19 +183,21 @@ class CryptoMarketMaker(BaseStrategy):
             return []
 
         # --- T-10s DIRECTIONAL MODE ---
-        # In last 10 seconds, if direction is clear, BUY the winning side
+        # In last 10 seconds, if CEX > strike, BUY Up for settlement profit.
+        # UP-ONLY RULE: We NEVER buy Down tokens. If direction is Down, skip.
         if (market.seconds_remaining <= 10 and not self._directional_sent and
             self._cex_price and self._cex_price > 0 and
             self._strike_price and self._strike_price > 0):
 
             distance = (self._cex_price - self._strike_price) / self._strike_price
-            abs_distance = abs(distance)
 
-            # If CEX is >0.1% from strike, direction is highly likely
-            if abs_distance > 0.001:
-                direction = "Up" if distance > 0 else "Down"
+            # Only fire if CEX > strike (direction=Up) by >0.1%
+            if distance > 0.001:
                 self._directional_sent = True
-                return self._generate_directional_signal(market, direction)
+                return self._generate_directional_signal(market, "Up")
+            else:
+                # Direction is Down or too close — skip (Up-only rule)
+                self._directional_sent = True  # don't retry
 
         # Don't quote too frequently
         now = time.time()
@@ -259,16 +261,16 @@ class CryptoMarketMaker(BaseStrategy):
 
     def _generate_directional_signal(self, market: MarketInfo, direction: str) -> list[Signal]:
         """
-        T-10s Directional Mode: place one-sided GTC maker order
-        on the likely winning side for settlement profit.
+        T-10s Directional Mode: place GTC maker BUY Up order.
 
-        Called when CEX price is >0.1% from strike with <10s remaining.
-        Dynamic pricing: more distance = higher price (more confident).
+        UP-ONLY: This is ALWAYS direction="Up" — caller must not pass "Down".
+        Dynamic pricing: more distance from strike = higher price (more confident).
         """
-        outcome = Outcome.UP if direction == "Up" else Outcome.DOWN
+        # Enforce Up-only invariant
+        assert direction == "Up", f"Up-only rule violated: direction={direction}"
 
-        # I1 FIX: Dynamic maker price based on distance from strike
-        distance = abs(self._cex_price - self._strike_price) / self._strike_price
+        # Dynamic maker price based on distance from strike
+        distance = (self._cex_price - self._strike_price) / self._strike_price
         if distance > 0.005:     # >0.5% from strike — very confident
             maker_price = 0.95
         elif distance > 0.002:   # >0.2% from strike
@@ -282,13 +284,13 @@ class CryptoMarketMaker(BaseStrategy):
 
         signal = Signal(
             market=market,
-            outcome=outcome,
+            outcome=Outcome.UP,  # Always Up
             side=Side.BUY,
             price=maker_price,
             size_usd=order_size,
             confidence=0.95,
             reason=(
-                f"MM T-10s directional: {direction} GTC@${maker_price:.2f} | "
+                f"MM T-10s directional: Up GTC@${maker_price:.2f} | "
                 f"cex={self._cex_price:.2f} vs strike={self._strike_price:.2f} | "
                 f"dist={distance:.4%} | T-{market.seconds_remaining:.0f}s"
             ),
@@ -296,7 +298,7 @@ class CryptoMarketMaker(BaseStrategy):
         )
 
         self._logger.info(
-            f"🎯 T-10s DIRECTIONAL: {direction} GTC@${maker_price:.2f} × ${order_size:.0f} | "
+            f"🎯 T-10s DIRECTIONAL: Up GTC@${maker_price:.2f} × ${order_size:.0f} | "
             f"T-{market.seconds_remaining:.0f}s"
         )
 
