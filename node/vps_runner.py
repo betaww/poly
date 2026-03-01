@@ -347,15 +347,25 @@ class VPSRunner:
         """Handle end of round for a strategy."""
         await self._executor.cancel_all()
 
-        # C2 FIX: Use CEX price vs strike for settlement, not market.price_up
+        # Settlement: determine if Up or Down won
+        # Priority: 1) Brain CEX prediction, 2) Strategy's cached CEX price, 3) coin flip
         pred = self._redis.get_prediction(market.asset)
         cex_price = pred.cex_price if pred else 0
+
+        # Fallback: use strategy's own cached CEX price if Brain is offline
+        if cex_price <= 0:
+            strat = slot.strategy
+            if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
+                cex_price = strat._cex_price
+
         if cex_price > 0 and market.strike_price > 0:
             settled = "Up" if cex_price > market.strike_price else "Down"
         else:
-            # Fallback: use market price if no CEX data
-            settled = "Up" if market.price_up > 0.5 else "Down"
-            logger.warning(f"No CEX price for settlement, using market price fallback")
+            # Last resort: 50/50 coin flip (DO NOT use market.price_up — it's biased
+            # by our own buying activity, leading to 96% false win rate)
+            import random
+            settled = random.choice(["Up", "Down"])
+            logger.warning(f"No CEX price for settlement, using random 50/50 fallback")
 
         await slot.strategy.on_round_end(market, settled)
 
