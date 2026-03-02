@@ -362,30 +362,40 @@ class SyntheticOracle:
     def _weighted_median(self, prices_weights: list[tuple[float, float]]) -> float:
         """Compute weighted median — matches Chainlink's median-of-medians logic.
 
+        v10 FIX #11: Added linear interpolation at 50% crossing point for
+        higher precision with only 3-4 sources.
         For 1 source: returns that price (no median possible).
         For 2 sources: returns weighted average (avoids systematic lower-price bias).
-        For 3+ sources: proper weighted median (robust to outliers).
+        For 3+ sources: interpolated weighted median (robust + continuous).
         """
         if not prices_weights:
             return 0.0
-        # Sort by price
         pw = sorted(prices_weights, key=lambda x: x[0])
         total = sum(w for _, w in pw)
         if total == 0:
             return 0.0
-        # C1 FIX: 1 source — return price directly (logged as warning upstream)
         if len(pw) == 1:
             return pw[0][0]
-        # Special case: 2 sources — weighted average avoids lower-price bias
+        # Special case: 2 sources — weighted average
         if len(pw) == 2:
             return (pw[0][0] * pw[0][1] + pw[1][0] * pw[1][1]) / total
-        # 3+ sources: proper weighted median
+        # 3+ sources: interpolated weighted median
+        # v10 FIX #11: Instead of returning discrete price at crossing,
+        # linearly interpolate between the two prices straddling the 50% mark
+        half = total / 2
         cumulative = 0.0
-        for price, weight in pw:
+        for i, (price, weight) in enumerate(pw):
+            prev_cum = cumulative
             cumulative += weight
-            if cumulative > total / 2:  # strict > for proper lower-median
-                return price
-        return pw[-1][0]  # fallback: last price
+            if cumulative > half:
+                if i == 0 or prev_cum >= half:
+                    return price  # edge case: first item crosses
+                # Linear interpolation between pw[i-1] and pw[i]
+                prev_price = pw[i - 1][0]
+                # How far past the previous into this level is the 50% mark
+                frac = (half - prev_cum) / weight if weight > 0 else 0.0
+                return prev_price + frac * (price - prev_price)
+        return pw[-1][0]
 
     def predict(self) -> tuple[float, float]:
         """
@@ -427,6 +437,12 @@ class SyntheticOracle:
         # Kalman-weighted median fusion: use Kalman as primary when initialized
         kalman_price = self._kalman.price
         if kalman_price > 0 and wm_predicted > 0:
+            # v10 FIX #7: Adapt Kalman Q from Parkinson volatility
+            parkinson_vol = self.get_volatility()
+            # Floor at 1e-7 (not 1e-5): computed Q = vol² × 0.01
+            # For 1% vol: Q = 1e-6 (should not be floored)
+            # For 0.01% vol: Q = 1e-10 → floor to 1e-7
+            self._kalman.Q = max(1e-7, (parkinson_vol ** 2) * 0.01)
             # Blend: 70% Kalman (adaptive) + 30% weighted median (robust)
             predicted = 0.7 * kalman_price + 0.3 * wm_predicted
         else:

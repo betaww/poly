@@ -57,6 +57,8 @@ class StrategySlot:
         self.predicted_direction = ""
         self.pnl_before_round = 0.0  # snapshot for per-round delta
         self._settlement_cex_snapshot: float = 0.0  # C4 FIX: explicit init
+        # v10 FIX #2: Strike freshness TTL
+        self._strike_set_at: float = 0.0  # when strike was last set
 
 
 class VPSRunner:
@@ -117,6 +119,9 @@ class VPSRunner:
         self._depth_feed.start(config.market.assets)
         # E3: Wire CLOB feed into executor for real depth
         self._executor._clob_feed = self._book_feed
+        # v10 FIX #14: Clock offset tracking (VPS vs Polymarket server)
+        self._clock_offset: float = 0.0  # seconds; positive = VPS ahead
+        self._last_clock_sync: float = 0.0
 
     def _handle_control(self, command: str, data: dict):
         """Handle control commands from Mac dashboard."""
@@ -138,27 +143,61 @@ class VPSRunner:
                 self.config.strategy.base_spread = float(data["spread"])
                 logger.info(f"Config updated: spread={data['spread']}")
 
-    def _feed_predictions_to_strategy(self, slot: StrategySlot, market: MarketInfo):
+    async def _feed_predictions_to_strategy(self, slot: StrategySlot, market: MarketInfo):
         """Push brain predictions into strategy."""
         pred = self._redis.get_prediction(market.asset)
-        if pred is None:
-            # A4 FIX: log when Brain data is missing
-            if market.seconds_remaining < 12:  # only log near commitment window
-                logger.warning(f"⚠️ No prediction for {slot.name} ({market.asset}) | T-{market.seconds_remaining:.0f}s")
-            return
+
+        # v10 FIX #12: VPS fallback oracle when Brain is offline
+        if pred is None or (pred and pred.cex_price <= 0):
+            if market.seconds_remaining < 15:
+                # Near commitment window with no Brain — try HTTP fallback
+                fallback_price = await self._vps_fallback_cex_price(market.asset)
+                if fallback_price > 0:
+                    strat = slot.strategy
+                    if hasattr(strat, 'set_cex_price'):
+                        strat.set_cex_price(fallback_price)
+                    if hasattr(strat, 'set_strike_price') and market.strike_price > 0:
+                        strat.set_strike_price(market.strike_price)
+                    logger.info(
+                        f"🔄 Brain offline fallback: {market.asset.upper()} "
+                        f"CEX=${fallback_price:,.2f} (HTTP)"
+                    )
+                    # Track prediction direction from fallback
+                    if fallback_price > 0 and market.strike_price > 0:
+                        slot.predicted_direction = "Up" if fallback_price > market.strike_price else "Down"
+                    if market.seconds_remaining < 3:
+                        slot._settlement_cex_snapshot = fallback_price
+                    # Still try CLOB / OFI below
+                else:
+                    if market.seconds_remaining < 12:
+                        logger.warning(
+                            f"⚠️ No prediction for {slot.name} ({market.asset}) | T-{market.seconds_remaining:.0f}s"
+                        )
+                    return
+            else:
+                return
+
+        if pred and pred.cex_price > 0:
+            strat = slot.strategy
+            # Universal setters for all strategies that have them
+            if hasattr(strat, 'set_cex_price'):
+                strat.set_cex_price(pred.cex_price)
+            if hasattr(strat, 'set_volatility'):
+                strat.set_volatility(pred.volatility)
+            if hasattr(strat, 'set_strike_price') and market.strike_price > 0:
+                strat.set_strike_price(market.strike_price)
+
+            # Track predicted direction for round recording
+            if pred.cex_price > 0 and market.strike_price > 0:
+                slot.predicted_direction = "Up" if pred.cex_price > market.strike_price else "Down"
+
+            # M6 FIX: Snapshot CEX price near round end for settlement accuracy
+            if market.seconds_remaining < 3 and pred.cex_price > 0:
+                slot._settlement_cex_snapshot = pred.cex_price
 
         strat = slot.strategy
 
-        # Universal setters for all strategies that have them
-        if hasattr(strat, 'set_cex_price'):
-            strat.set_cex_price(pred.cex_price)
-        if hasattr(strat, 'set_volatility'):
-            strat.set_volatility(pred.volatility)
-        if hasattr(strat, 'set_strike_price') and market.strike_price > 0:
-            strat.set_strike_price(market.strike_price)
-
         # C3 FIX: Update market prices from CLOB book feed in real-time
-        # so midpoint reflects current market, not frozen discovery-time value
         book_up = self._book_feed.get_book(market.token_id_up)
         if book_up:
             market.price_up = book_up.midpoint
@@ -185,13 +224,59 @@ class VPSRunner:
             ofi = self._depth_feed.get_ofi(market.asset)
             strat.set_ofi(ofi)
 
-        # Track predicted direction for round recording
-        if pred.cex_price > 0 and market.strike_price > 0:
-            slot.predicted_direction = "Up" if pred.cex_price > market.strike_price else "Down"
+    async def _vps_fallback_cex_price(self, asset: str) -> float:
+        """v10 FIX #12: Lightweight VPS-side oracle fallback when Brain is offline.
 
-        # M6 FIX: Snapshot CEX price near round end for settlement accuracy
-        if market.seconds_remaining < 3 and pred.cex_price > 0:
-            slot._settlement_cex_snapshot = pred.cex_price
+        Uses direct HTTP call to Binance (available from VPS) to get current price.
+        Less accurate than Brain's multi-source Kalman fusion but prevents total
+        blackout when Alienware is down.
+        """
+        symbol = f"{asset.upper()}USDT"
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(
+                    f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+                )
+                if resp.status_code == 200:
+                    return float(resp.json()["price"])
+        except Exception as e:
+            logger.debug(f"VPS fallback CEX failed for {asset}: {e}")
+        return 0.0
+
+    async def _calibrate_clock(self):
+        """v10 FIX #14: Calibrate VPS clock against Polymarket API server time.
+
+        Computes offset between local time and server time to correct
+        seconds_remaining calculations. Runs every ~5 minutes.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                t_before = time.time()
+                resp = await client.get(f"{self.config.api.gamma_host}/events?limit=1")
+                t_after = time.time()
+                rtt = t_after - t_before
+
+                if resp.status_code == 200:
+                    # Use HTTP Date header as server time reference
+                    date_header = resp.headers.get("date", "")
+                    if date_header:
+                        from email.utils import parsedate_to_datetime
+                        server_time = parsedate_to_datetime(date_header).timestamp()
+                        local_time = (t_before + t_after) / 2  # midpoint estimate
+                        self._clock_offset = local_time - server_time
+                        self._last_clock_sync = time.time()
+                        if abs(self._clock_offset) > 1.0:
+                            logger.warning(
+                                f"⏰ Clock offset: {self._clock_offset:+.2f}s "
+                                f"(VPS {'ahead' if self._clock_offset > 0 else 'behind'}, RTT={rtt*1000:.0f}ms)"
+                            )
+                        else:
+                            logger.debug(f"Clock sync OK: offset={self._clock_offset:+.3f}s RTT={rtt*1000:.0f}ms")
+                    else:
+                        self._last_clock_sync = time.time()
+        except Exception as e:
+            logger.debug(f"Clock calibration failed: {e}")
+            self._last_clock_sync = time.time()  # don't retry immediately
 
     def _publish_telemetry(self):
         """Publish current state to Mac dashboard."""
@@ -293,11 +378,21 @@ class VPSRunner:
         if not best_markets:
             return
 
+        # v10 FIX #14: Periodic clock offset calibration (~every 5 min)
+        now = time.time()
+        if now - self._last_clock_sync > 300:
+            await self._calibrate_clock()
+
         # M6 FIX: Dispatch each market to asset-specific slots only.
         # Each slot is bound to one asset, preventing round-thrashing.
         for slot in self._slots:
             market = best_markets.get(slot.asset)
             if market:
+                # v10 FIX #14: Adjust market timing with clock offset
+                if abs(self._clock_offset) > 0.5:
+                    # Correct end_time; positive offset = VPS ahead = we think
+                    # less time remaining than reality
+                    market.end_time = int(market.end_time + self._clock_offset)
                 await self._run_strategy_on_market(slot, market)
 
         # Publish telemetry
@@ -324,6 +419,7 @@ class VPSRunner:
                 pred = self._redis.get_prediction(market.asset)
                 if pred and pred.cex_price > 0:
                     market.strike_price = pred.cex_price
+                    slot._strike_set_at = time.time()  # v10 FIX #2
                     logger.info(
                         f"Dynamic strike set: {market.asset.upper()} "
                         f"${market.strike_price:,.2f} (CEX at round start)"
@@ -333,6 +429,7 @@ class VPSRunner:
                     strat = slot.strategy
                     if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
                         market.strike_price = strat._cex_price
+                        slot._strike_set_at = time.time()  # v10 FIX #2
                         logger.info(
                             f"Dynamic strike set (fallback): {market.asset.upper()} "
                             f"${market.strike_price:,.2f}"
@@ -346,6 +443,22 @@ class VPSRunner:
         # was set on slot.current_market during round transition — pass it through.
         if market.strike_price <= 0 and slot.current_market and slot.current_market.strike_price > 0:
             market.strike_price = slot.current_market.strike_price
+
+        # v10 FIX #2: Strike freshness TTL — expire strikes older than 120s
+        # Prevents stale-strike trades after Brain reconnection
+        if slot._strike_set_at > 0 and (time.time() - slot._strike_set_at) > 120:
+            # Try to refresh strike from current prediction
+            pred = self._redis.get_prediction(market.asset)
+            if pred and pred.cex_price > 0:
+                old_strike = market.strike_price
+                market.strike_price = pred.cex_price
+                slot._strike_set_at = time.time()
+                if slot.current_market:
+                    slot.current_market.strike_price = market.strike_price
+                logger.info(
+                    f"Strike refreshed (TTL): {market.asset.upper()} "
+                    f"${old_strike:,.2f} → ${market.strike_price:,.2f}"
+                )
 
         # BLIND SPOT FIX: Subscribe to CLOB orderbook for new market tokens
         for token_id, (asset, outcome) in [
@@ -370,7 +483,7 @@ class VPSRunner:
             return
 
         # Feed brain predictions
-        self._feed_predictions_to_strategy(slot, market)
+        await self._feed_predictions_to_strategy(slot, market)
 
         # CRIT2 FIX: Poll for live order fills (live mode only)
         if self.config.mode != "paper":
@@ -557,6 +670,7 @@ class VPSRunner:
                 paper_cex_price=cex_price,
                 paper_strike=strike,
                 strategy=slot.name,
+                confidence=getattr(slot.strategy, '_last_confidence', 0.0),  # v10 FIX #10
             )
 
     async def _shutdown(self):

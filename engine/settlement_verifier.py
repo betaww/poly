@@ -11,6 +11,8 @@ actual resolution.
 import asyncio
 import json
 import logging
+import os
+import sqlite3
 import time
 from dataclasses import dataclass, field
 
@@ -38,6 +40,7 @@ class VerificationRecord:
     actual_down_price: float    # Polymarket's final outcomePrices[1]
     timestamp: float
     strategy: str = ""
+    confidence: float = 0.0     # v10 FIX #10: confidence at signal time
 
 
 @dataclass
@@ -52,6 +55,16 @@ class VerificationStats:
     per_asset: dict = field(default_factory=lambda: {
         "btc": {"verified": 0, "matches": 0, "mismatches": 0},
         "eth": {"verified": 0, "matches": 0, "mismatches": 0},
+    })
+
+    # v10 FIX #10: Confidence calibration bins
+    # Key = bin label (e.g. "0.55-0.65"), value = {"total": N, "correct": M}
+    calibration_bins: dict = field(default_factory=lambda: {
+        "0.50-0.60": {"total": 0, "correct": 0},
+        "0.60-0.70": {"total": 0, "correct": 0},
+        "0.70-0.80": {"total": 0, "correct": 0},
+        "0.80-0.90": {"total": 0, "correct": 0},
+        "0.90-1.00": {"total": 0, "correct": 0},
     })
 
     @property
@@ -70,11 +83,103 @@ class VerificationStats:
 class SettlementVerifier:
     """Asynchronous settlement verifier that checks Polymarket actual outcomes."""
 
-    def __init__(self):
+    def __init__(self, db_path: str = "data/paper_trades.db"):
         self._client = httpx.AsyncClient(timeout=10, follow_redirects=True)
         self._stats = VerificationStats()
         self._records: list[VerificationRecord] = []
         self._pending_tasks: set[asyncio.Task] = set()
+        # v10 FIX #13: SQLite persistence
+        self._db_path = db_path
+        self._init_db()
+        self._load_from_db()
+
+    def _init_db(self):
+        """v10 FIX #13: Create verification table if not exists."""
+        try:
+            os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+            conn = sqlite3.connect(self._db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settlement_verifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slug TEXT, asset TEXT, strategy TEXT,
+                    paper_settlement TEXT, actual_settlement TEXT,
+                    match BOOLEAN,
+                    paper_cex REAL, paper_strike REAL,
+                    actual_up_price REAL, actual_down_price REAL,
+                    confidence REAL,
+                    timestamp REAL
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Verifier DB init failed: {e}")
+
+    def _load_from_db(self):
+        """v10 FIX #13: Reload historical verification stats from DB."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            rows = conn.execute(
+                "SELECT asset, paper_settlement, actual_settlement, match, confidence "
+                "FROM settlement_verifications WHERE actual_settlement != 'Unknown'"
+            ).fetchall()
+            conn.close()
+            for asset, paper, actual, matched, conf in rows:
+                self._stats.total_verified += 1
+                asset_stats = self._stats.per_asset.setdefault(
+                    asset, {"verified": 0, "matches": 0, "mismatches": 0}
+                )
+                asset_stats["verified"] += 1
+                if matched:
+                    self._stats.matches += 1
+                    asset_stats["matches"] += 1
+                else:
+                    self._stats.mismatches += 1
+                    asset_stats["mismatches"] += 1
+                # Calibration
+                if conf and conf > 0:
+                    self._record_calibration(conf, bool(matched))
+            if rows:
+                logger.info(
+                    f"Loaded {len(rows)} historical verifications from DB: "
+                    f"{self._stats.matches}/{self._stats.total_verified} correct ({self._stats.accuracy:.1%})"
+                )
+        except Exception as e:
+            logger.debug(f"Verifier DB load failed (first run?): {e}")
+
+    def _persist_record(self, record: VerificationRecord):
+        """v10 FIX #13: Write a verification record to SQLite."""
+        try:
+            conn = sqlite3.connect(self._db_path)
+            conn.execute(
+                "INSERT INTO settlement_verifications "
+                "(slug, asset, strategy, paper_settlement, actual_settlement, "
+                "match, paper_cex, paper_strike, actual_up_price, actual_down_price, "
+                "confidence, timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (record.slug, record.asset, record.strategy,
+                 record.paper_settlement, record.actual_settlement,
+                 record.match, record.paper_cex_price, record.paper_strike,
+                 record.actual_up_price, record.actual_down_price,
+                 record.confidence, record.timestamp)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Verifier DB write failed: {e}")
+
+    def _record_calibration(self, confidence: float, correct: bool):
+        """v10 FIX #10: Record into calibration bins."""
+        bins = [(0.50, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 0.90), (0.90, 1.00)]
+        for lo, hi in bins:
+            if lo <= confidence < hi or (hi == 1.00 and confidence >= 0.90):
+                key = f"{lo:.2f}-{hi:.2f}"
+                bin_data = self._stats.calibration_bins.setdefault(
+                    key, {"total": 0, "correct": 0}
+                )
+                bin_data["total"] += 1
+                if correct:
+                    bin_data["correct"] += 1
+                break
 
     @property
     def stats(self) -> VerificationStats:
@@ -92,12 +197,9 @@ class SettlementVerifier:
         paper_cex_price: float,
         paper_strike: float,
         strategy: str = "",
+        confidence: float = 0.0,  # v10 FIX #10
     ):
-        """Schedule a delayed verification check after round ends.
-        
-        Non-blocking: creates a background asyncio task that runs after
-        VERIFICATION_DELAY_S seconds.
-        """
+        """Schedule a delayed verification check after round ends."""
         task = asyncio.create_task(
             self._verify_after_delay(
                 slug=slug,
@@ -106,6 +208,7 @@ class SettlementVerifier:
                 paper_cex_price=paper_cex_price,
                 paper_strike=paper_strike,
                 strategy=strategy,
+                confidence=confidence,
             )
         )
         self._pending_tasks.add(task)
@@ -120,6 +223,7 @@ class SettlementVerifier:
         paper_cex_price: float,
         paper_strike: float,
         strategy: str,
+        confidence: float = 0.0,
     ):
         """Wait, then fetch and compare actual settlement."""
         await asyncio.sleep(VERIFICATION_DELAY_S)
@@ -153,8 +257,11 @@ class SettlementVerifier:
             actual_down_price=actual_down,
             timestamp=time.time(),
             strategy=strategy,
+            confidence=confidence,
         )
         self._records.append(record)
+        # v10 FIX #13: Persist to SQLite
+        self._persist_record(record)
 
         # Update stats
         if actual_settlement == "Unknown":
@@ -172,7 +279,7 @@ class SettlementVerifier:
                 asset_stats["matches"] += 1
                 logger.info(
                     f"✅ VERIFIED: {slug} | paper={paper_settlement} actual={actual_settlement} | "
-                    f"CEX=${paper_cex_price:.2f} strike=${paper_strike:.2f} | "
+                    f"CEX=${paper_cex_price:.2f} strike=${paper_strike:.2f} | conf={confidence:.1%} | "
                     f"PM prices: Up={actual_up:.3f} Down={actual_down:.3f}"
                 )
             else:
@@ -180,9 +287,13 @@ class SettlementVerifier:
                 asset_stats["mismatches"] += 1
                 logger.warning(
                     f"❌ MISMATCH: {slug} | paper={paper_settlement} actual={actual_settlement} | "
-                    f"CEX=${paper_cex_price:.2f} strike=${paper_strike:.2f} | "
+                    f"CEX=${paper_cex_price:.2f} strike=${paper_strike:.2f} | conf={confidence:.1%} | "
                     f"PM prices: Up={actual_up:.3f} Down={actual_down:.3f}"
                 )
+
+            # v10 FIX #10: Record calibration data
+            if confidence > 0:
+                self._record_calibration(confidence, match)
 
             # Periodic summary
             s = self._stats
@@ -254,6 +365,13 @@ class SettlementVerifier:
                     f"  {asset.upper()}: {data['matches']}/{data['verified']} ({acc:.0f}%) "
                     f"| mismatches={data['mismatches']}"
                 )
+        # v10 FIX #10: Calibration summary
+        if any(v["total"] > 0 for v in s.calibration_bins.values()):
+            lines.append("  Confidence Calibration:")
+            for bin_label, data in sorted(s.calibration_bins.items()):
+                if data["total"] > 0:
+                    actual_wr = data["correct"] / data["total"] * 100
+                    lines.append(f"    {bin_label}: {data['correct']}/{data['total']} ({actual_wr:.0f}% actual WR)")
         return "\n".join(lines)
 
     async def close(self):

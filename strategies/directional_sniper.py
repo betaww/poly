@@ -30,6 +30,15 @@ from typing import Optional
 
 from scipy.stats import t as t_dist
 
+# Log-odds helpers for independent D1/D2/D3 fusion
+def _to_log_odds(p: float) -> float:
+    p = max(0.01, min(0.99, p))
+    return math.log(p / (1.0 - p))
+
+def _from_log_odds(lo: float) -> float:
+    lo = max(-20.0, min(20.0, lo))  # guard against exp overflow
+    return 1.0 / (1.0 + math.exp(-lo))
+
 from .base import BaseStrategy, Signal, Side, Outcome
 from ..config import Config
 from ..market_scanner import MarketInfo
@@ -86,13 +95,14 @@ class DirectionalSniper(BaseStrategy):
     def set_cex_price(self, price: float):
         self._cex_price = price
         # D1: Update EMAs on each price update
+        # v10 FIX #6: Slowed EMAs to match 5-min window (was α=0.2/0.05, too noisy at 1Hz)
         if not self._ema_initialized and price > 0:
             self._ema_fast = price
             self._ema_slow = price
             self._ema_initialized = True
         elif self._ema_initialized:
-            self._ema_fast = 0.8 * self._ema_fast + 0.2 * price   # α=0.2 (fast)
-            self._ema_slow = 0.95 * self._ema_slow + 0.05 * price  # α=0.05 (slow)
+            self._ema_fast = 0.95 * self._ema_fast + 0.05 * price   # α=0.05 (half-life ~14s)
+            self._ema_slow = 0.99 * self._ema_slow + 0.01 * price   # α=0.01 (half-life ~70s)
 
     def set_strike_price(self, strike: float):
         self._strike_price = strike
@@ -116,9 +126,10 @@ class DirectionalSniper(BaseStrategy):
 
         Returns ("Up"/"Down"/"Unknown", confidence 0.0-1.0).
 
-        M2 FIX: Confidence now uses volatility-normalized distance
-        instead of fixed percentage thresholds. This prevents
-        triggering on noise-level moves in low-vol conditions.
+        v10 FIX #3: D1/D2/D3 now fuse independently in log-odds space
+        instead of sequential multiplication (avoids double-counting).
+        v10 FIX #1: Deadzone widened to 0.05% (was 0.005%) to filter
+        boundary rounds that cause MISMATCH with Chainlink.
         """
         if self._cex_price <= 0 or self._strike_price <= 0:
             return "Unknown", 0.0
@@ -126,69 +137,68 @@ class DirectionalSniper(BaseStrategy):
         distance = (self._cex_price - self._strike_price) / self._strike_price
         abs_distance = abs(distance)
 
-        if abs_distance < 0.00005:  # < 0.005% — effectively at strike
+        # v10 FIX #1: Widened deadzone (was 0.00005 = 0.005%)
+        # Settlement Verifier showed ALL mismatches at CEX ≈ strike boundary
+        if abs_distance < 0.0005:  # < 0.05% — boundary zone, too risky
             return "Unknown", 0.50
 
         direction = "Up" if distance > 0 else "Down"
 
-        # M2 FIX: Normalize by volatility — distance that is large relative
-        # to recent vol deserves high confidence; same distance in high vol
-        # is just noise. vol is typically 0.001-0.05 for 5-min BTC.
+        # M2 FIX: Normalize by volatility
         vol = max(self._volatility, 0.001)
-        z_score = abs_distance / vol  # "standard deviations" of move
+        z_score = abs_distance / vol
 
-        # Student-t CDF (df=4): fat-tail correction for 5-min crypto returns.
-        # Normal CDF systematically underestimates extreme event probability;
-        # t(4) has heavier tails, matching empirical 5-min BTC return distribution.
+        # Student-t CDF (df=4): fat-tail correction
         raw_conf = t_dist.cdf(z_score, df=4)
-        confidence = max(0.50, min(0.95, raw_conf))
+        base_conf = max(0.50, min(0.95, raw_conf))
 
-        # D1: EMA trend adjustment — reward momentum alignment, punish divergence
-        conf_after_zscore = confidence  # diagnostic
+        # --- v10 FIX #3: Independent fusion in log-odds space ---
+        # Each stage computes an *additive delta* in log-odds, preventing
+        # sequential dependence and double-counting.
+        base_log_odds = _to_log_odds(base_conf)
+        d1_delta = 0.0  # EMA trend
+        d2_delta = 0.0  # CLOB Bayesian
+        d3_delta = 0.0  # OFI
+
+        # D1: EMA trend adjustment
+        # v10 FIX #6: Added trend magnitude threshold (0.1%) to filter noise
         if self._ema_initialized and self._ema_slow > 0:
             trend = (self._ema_fast - self._ema_slow) / self._ema_slow
-            if (direction == "Up" and trend > 0) or (direction == "Down" and trend < 0):
-                # Trend confirms direction → boost confidence (max +10%)
-                confidence *= 1.0 + min(abs(trend) * 500, 0.10)
-            else:
-                # Trend opposes direction → reduce confidence (max -10%)
-                # Reduced from -20% — 5-min markets have weak trend signals
-                confidence *= max(0.90, 1.0 - abs(trend) * 300)
+            if abs(trend) > 0.001:  # only act on > 0.1% trend
+                if (direction == "Up" and trend > 0) or (direction == "Down" and trend < 0):
+                    d1_delta = min(abs(trend) * 200, 0.40)   # max +10% conf equiv
+                else:
+                    d1_delta = -min(abs(trend) * 150, 0.40)  # max -10% conf equiv
 
-        conf_after_d1 = confidence  # diagnostic
-
-        # D2: Bayesian fusion with CLOB implied probability
-        # Skip when CLOB is in 0.45-0.55 "uninformed" zone (market is 50/50)
+        # D2: CLOB Bayesian fusion
+        # Skip when CLOB is in 0.45-0.55 "uninformed" zone
         if (0.05 < self._clob_midpoint < 0.45) or (0.55 < self._clob_midpoint < 0.95):
-            p_clob = self._clob_midpoint  # CLOB's market-implied P(Up)
-            p_cex = confidence if direction == "Up" else (1.0 - confidence)
-            # Guard: avoid log(0) or division-by-zero with extreme values
-            p_cex = max(0.02, min(0.98, p_cex))
-            # Bayesian update: P(Up|both) ∝ P(Up|CEX) × P(Up|CLOB)
-            odds_cex = p_cex / (1 - p_cex)
-            odds_clob = p_clob / (1 - p_clob)
-            combined_odds = odds_cex * odds_clob  # assume 0.5 prior → cancels
-            fused_up = combined_odds / (1 + combined_odds)
-            # Convert back to directional confidence, clamp to valid range
-            confidence = fused_up if direction == "Up" else (1.0 - fused_up)
-            confidence = max(0.50, min(0.95, confidence))
+            p_clob = self._clob_midpoint
+            clob_log_odds = _to_log_odds(p_clob)
+            # D2 delta = half the CLOB log-odds deviation from 0.5 (prior)
+            # "half" because CLOB is a secondary signal, not equally trusted
+            if direction == "Up":
+                d2_delta = clob_log_odds * 0.5  # positive if CLOB > 0.5
+            else:
+                d2_delta = -clob_log_odds * 0.5  # positive if CLOB < 0.5
 
-        # D3: OFI (Order Flow Imbalance) confirmation
-        # Significant OFI signal confirms or opposes CEX direction
+        # D3: OFI confirmation
         if abs(self._ofi) > 0.2:
             if (direction == "Up" and self._ofi > 0) or (direction == "Down" and self._ofi < 0):
-                # OFI confirms direction → boost confidence (max +10%)
-                confidence *= 1.0 + min(abs(self._ofi) * 0.15, 0.10)
+                d3_delta = min(abs(self._ofi) * 0.6, 0.40)   # confirms
             else:
-                # OFI opposes direction → reduce confidence (max -10%)
-                confidence *= max(0.90, 1.0 - abs(self._ofi) * 0.10)
-            confidence = max(0.50, min(0.95, confidence))
+                d3_delta = -min(abs(self._ofi) * 0.4, 0.40)  # opposes
 
-        # Diagnostic: log pipeline stages (only visible at INFO in commitment window)
-        self._last_confidence = confidence  # store for external access
-        self._last_z_score = conf_after_zscore  # store for diagnostics
+        # Fuse in log-odds space and convert back
+        fused_log_odds = base_log_odds + d1_delta + d2_delta + d3_delta
+        confidence = _from_log_odds(fused_log_odds)
+        confidence = max(0.50, min(0.95, confidence))
 
-        return direction, min(confidence, 0.95)
+        # Diagnostic
+        self._last_confidence = confidence
+        self._last_z_score = base_conf  # store base for diagnostics
+
+        return direction, confidence
 
     def _calculate_maker_price(self, confidence: float) -> float:
         """D5 FIX: Continuous maker price interpolation.
@@ -228,8 +238,9 @@ class DirectionalSniper(BaseStrategy):
         b = (1.0 / maker_price) - 1.0  # odds ratio (e.g., $0.60 → 0.667)
 
         # D6: Use empirical win-rate lower bound blended with model confidence
-        # This prevents Kelly from over-betting based on untested model estimates
-        if self.state.rounds_traded > 20:
+        # v10 FIX #4: Raised threshold from 20 to 50 rounds — Wilson CI is too
+        # wide with <50 observations, causing systematic position under-sizing.
+        if self.state.rounds_traded > 50:
             n = self.state.rounds_traded
             wins = self.state.rounds_won
             p_hat = wins / n
@@ -310,12 +321,15 @@ class DirectionalSniper(BaseStrategy):
             return []
 
         # D4: Time-weighted reversal scoring (recent reversals hurt more)
+        # v10 FIX #15: Lowered threshold from 2.5 to 1.5 — old value almost
+        # never triggered (needed 5+ rapid reversals). Now 3 reversals in
+        # 10 seconds will trigger (0.5 × 3 ≈ 1.5).
         now = time.time()
         weighted_reversals = sum(
             1.0 / (1.0 + (now - rt) / 10.0)
             for rt in self._reversal_times
         )
-        if weighted_reversals > 2.5:
+        if weighted_reversals > 1.5:
             if t <= 7:
                 self._signal_sent = True
             self._logger.info(

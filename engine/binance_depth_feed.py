@@ -64,6 +64,8 @@ class BinanceDepthFeed:
         self._ofi_history: dict[str, deque] = {}  # (timestamp, ofi_tick)
         self._assets: list[str] = []
         self._lock = threading.Lock()
+        # v10 FIX #5: Adaptive OFI normalization scale
+        self._ema_abs_ofi: dict[str, float] = {}  # EMA of |raw_ofi| per asset
 
     def start(self, assets: list[str]):
         """Start background thread for depth streams."""
@@ -72,6 +74,7 @@ class BinanceDepthFeed:
         self._assets = assets
         for asset in assets:
             self._ofi_history[asset] = deque(maxlen=1000)
+            self._ema_abs_ofi[asset] = 0.0
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -163,6 +166,10 @@ class BinanceDepthFeed:
     def get_ofi(self, asset: str) -> float:
         """Get normalized OFI for an asset over the rolling window.
 
+        v10 FIX #5: Uses adaptive EMA-based normalization instead of
+        hardcoded BTC=10/ETH=100 scale constants. Adapts automatically
+        to varying market depth across different regimes.
+
         Returns:
             float in [-1.0, +1.0], where:
             +1.0 = extreme buying pressure
@@ -180,15 +187,17 @@ class BinanceDepthFeed:
             # Sum OFI ticks within window
             raw_ofi = sum(ofi for ts, ofi in history if ts >= cutoff)
 
-            # Normalize: use a reference scale based on typical BTC/ETH L2 depth
-            # BTC top-5 depth is typically 5-50 BTC, so a ±10 OFI is significant
-            if asset == "btc":
-                scale = 10.0  # ~10 BTC net flow = strong signal
-            elif asset == "eth":
-                scale = 100.0  # ~100 ETH net flow = strong signal
+            # v10 FIX #5: Update EMA of |raw_ofi| for adaptive scale
+            abs_ofi = abs(raw_ofi)
+            ema = self._ema_abs_ofi.get(asset, 0.0)
+            if ema < 0.001:
+                # Bootstrap: use current value
+                self._ema_abs_ofi[asset] = max(abs_ofi, 1.0)
             else:
-                scale = 10.0
+                self._ema_abs_ofi[asset] = 0.95 * ema + 0.05 * abs_ofi
 
+            # Scale = 3x EMA of |OFI| (so OFI=1.0 means 3σ event)
+            scale = max(1.0, self._ema_abs_ofi[asset] * 3.0)
             normalized = max(-1.0, min(1.0, raw_ofi / scale))
             return normalized
 

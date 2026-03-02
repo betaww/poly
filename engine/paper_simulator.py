@@ -203,6 +203,7 @@ def estimate_gtc_fill_probability(
     is_buy: bool,
     volatility: float = 0.01,
     time_remaining: float = 300.0,  # M5 FIX: seconds until settlement
+    clob_resting_orders: int = 0,   # v10 FIX #8: num resting orders near our price
 ) -> float:
     """
     Estimate probability that a GTC limit order fills.
@@ -212,6 +213,7 @@ def estimate_gtc_fill_probability(
       - Time resting (longer = more likely)
       - Market volatility (higher vol = more likely to fill)
       - M5 FIX: Time remaining until settlement (less time = less liquidity)
+      - v10 FIX #8: CLOB competition (more resting orders = lower fill share)
 
     For buy orders: fills if market drops to our bid
     For sell orders: fills if market rises to our ask
@@ -238,22 +240,21 @@ def estimate_gtc_fill_probability(
     vol_adjusted = distance_pct / max(0.001, volatility)
 
     # Base probability: exponential decay with distance
-    # At midpoint (distance=0): ~80% fill in 1 second
-    # At 1 tick out: ~50%
-    # At 2+ ticks out: drops sharply
     base_prob = math.exp(-vol_adjusted * 5.0)
 
     # Time factor: more resting time = higher probability
-    # Saturates at ~10 seconds
     time_factor = 1.0 - math.exp(-seconds_resting / 5.0)
 
-    # P3 FIX: Queue competition — we're not the only maker.
-    # In real 5-min markets, 3-10 bots compete for taker flow.
-    # We capture ~30% of available taker orders.
-    queue_penalty = 0.30
+    # v10 FIX #8: Dynamic queue competition based on CLOB data
+    # When we have real CLOB data, use it; otherwise fall back to 30%
+    if clob_resting_orders > 0:
+        # We capture ~1/N of available taker flow
+        queue_penalty = 1.0 / max(1, clob_resting_orders)
+    else:
+        # P3 FIX: Default — assume 3-4 competing makers
+        queue_penalty = 0.30
 
-    # M5 FIX: Liquidity dries up near settlement — fewer counterparties.
-    # At T-60s: full liquidity (1.0x). At T-5s: ~40% liquidity.
+    # M5 FIX: Liquidity dries up near settlement
     if time_remaining < 30:
         settlement_factor = 0.4 + 0.6 * (time_remaining / 30.0)
     else:
