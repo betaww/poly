@@ -51,6 +51,9 @@ class BrainRunner:
         }
         if "eth" in config.market.assets:
             self._oracles["eth"] = SyntheticOracle(config)
+        # v11 #9: Track startup time for warmup flag
+        self._start_time: float = 0.0
+        self._warmup_seconds: float = 30.0  # warmup window
 
     def _connect_redis(self):
         """Connect to Redis."""
@@ -84,6 +87,9 @@ class BrainRunner:
         if not self._redis:
             return
 
+        # v11 #9: Brain warmup flag
+        is_warmup = (time.time() - self._start_time) < self._warmup_seconds
+
         for asset, oracle in self._oracles.items():
             predicted_price, confidence = oracle.predict()
             if predicted_price == 0:
@@ -98,6 +104,7 @@ class BrainRunner:
                 "volatility": round(volatility, 6),
                 "sources": len(oracle.prices),
                 "timestamp": time.time(),
+                "warmup": is_warmup,  # v11 #9
             })
 
             try:
@@ -150,6 +157,7 @@ class BrainRunner:
     async def start(self):
         """Start the brain node."""
         self._running = True
+        self._start_time = time.time()  # v11 #9
         self._connect_redis()
 
         logger.info(f"""

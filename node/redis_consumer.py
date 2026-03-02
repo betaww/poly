@@ -28,6 +28,7 @@ class Prediction:
     sources: int
     timestamp: float
     age_ms: float = 0.0
+    warmup: bool = False  # v11 #9: Brain warmup flag
 
     @property
     def is_stale(self) -> bool:
@@ -154,6 +155,7 @@ class RedisConsumer:
             sources=data.get("sources", 0),
             timestamp=data.get("timestamp", 0),
             age_ms=(time.time() - data.get("timestamp", time.time())) * 1000,
+            warmup=data.get("warmup", False),  # v11 #9
         )
 
         with self._lock:

@@ -122,6 +122,8 @@ class VPSRunner:
         # v10 FIX #14: Clock offset tracking (VPS vs Polymarket server)
         self._clock_offset: float = 0.0  # seconds; positive = VPS ahead
         self._last_clock_sync: float = 0.0
+        # v11 #15: Cross-asset correlation tracking
+        self._slot_signals_this_cycle: dict[str, str] = {}  # {asset: direction}
 
     def _handle_control(self, command: str, data: dict):
         """Handle control commands from Mac dashboard."""
@@ -383,6 +385,9 @@ class VPSRunner:
         if now - self._last_clock_sync > 300:
             await self._calibrate_clock()
 
+        # v11 #15: Reset cross-asset correlation tracking each scan cycle
+        self._slot_signals_this_cycle = {}
+
         # M6 FIX: Dispatch each market to asset-specific slots only.
         # Each slot is bound to one asset, preventing round-thrashing.
         for slot in self._slots:
@@ -390,8 +395,6 @@ class VPSRunner:
             if market:
                 # v10 FIX #14: Adjust market timing with clock offset
                 if abs(self._clock_offset) > 0.5:
-                    # Correct end_time; positive offset = VPS ahead = we think
-                    # less time remaining than reality
                     market.end_time = int(market.end_time + self._clock_offset)
                 await self._run_strategy_on_market(slot, market)
 
@@ -499,14 +502,43 @@ class VPSRunner:
         signals = await slot.strategy.on_market_update(market)
 
         if signals:
-            # CRIT3 FIX: Don't cancel ALL orders — our GTC makers need time to rest.
-            # Only cancel orders from PREVIOUS rounds (older than current round start).
-            # Round-end already calls cancel_all() for cleanup.
-            pass  # removed blanket cancel_all — let GTC orders rest
+            # v11 #2: Handle CANCEL signals from direction re-check
+            if any(sig.order_type == "CANCEL" for sig in signals):
+                canceled = await self._executor.cancel_all()
+                logger.info(f"v11 Direction-reversal cancel: {canceled} orders canceled for {slot.name}")
+                return  # don't process further signals this cycle
+
+            # CRIT3 FIX: Don't cancel ALL orders — let GTC orders rest.
+            pass
+
+        # v11 #15: Cross-asset correlation penalty
+        # If both BTC and ETH have same-direction signals, penalize the second one
+        for sig in signals:
+            if sig.confidence > 0 and sig.size_usd > 0:
+                direction = "Up" if sig.outcome.value == "Up" else "Down"
+                other_dirs = [d for a, d in self._slot_signals_this_cycle.items() if a != slot.asset]
+                if other_dirs and direction in other_dirs:
+                    # Same direction as another asset → apply 50% correlation penalty
+                    strat = slot.strategy
+                    if hasattr(strat, 'set_correlation_penalty'):
+                        strat.set_correlation_penalty(0.5)
+                        logger.info(f"v11 Correlation penalty: {slot.asset.upper()} {direction} same as other asset")
+                self._slot_signals_this_cycle[slot.asset] = direction
+
+        # v11 #17: Pass CLOB best bid to strategy for maker price guard
+        strat = slot.strategy
+        if hasattr(strat, 'set_clob_best_bid') and hasattr(strat, '_trade_direction'):
+            trade_dir = strat._trade_direction or ("Down" if strat._cex_price < strat._strike_price else "Up")
+            token_id = market.token_id_down if trade_dir == "Down" else market.token_id_up
+            book = self._book_feed.get_book(token_id)
+            if book and book.best_bid > 0:
+                strat.set_clob_best_bid(book.best_bid)
 
         # Validate and execute (P0 FIX: cap fills per round for realism)
         MAX_FILLS_PER_ROUND = 3  # real 5-min markets: 1-3 maker fills max
         for sig in signals:
+            if sig.order_type == "CANCEL":  # v11: skip CANCEL pseudo-signals
+                continue
             if slot.round_fills >= MAX_FILLS_PER_ROUND:
                 break  # already filled enough this round
             approved, reason = self._risk.check_signal(sig, slot.strategy.state)
@@ -737,8 +769,16 @@ def main():
     config.node = "vps"
     runner = VPSRunner(config, strategy_name=args.strategy)
 
-    # M7 FIX: Use asyncio.run() directly — signal handlers registered inside start()
-    # Old code used deprecated asyncio.get_event_loop() which doesn't work in Python 3.12+
+    # v11 #18: Graceful shutdown handler
+    def _graceful_shutdown(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.warning(f"🛑 Received {sig_name} — initiating graceful shutdown...")
+        runner.stop()
+
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
+    # M7 FIX: Use asyncio.run() directly
     try:
         asyncio.run(runner.start())
     except KeyboardInterrupt:

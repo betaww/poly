@@ -46,6 +46,8 @@ class RiskManager:
     def __init__(self, config: Config):
         self.config = config
         self.state = RiskState()
+        # v11 #5: Recover daily PnL from ledger on startup
+        self._recover_daily_pnl()
 
     def check_signal(self, signal: Signal, strategy_state: StrategyState) -> tuple[bool, str]:
         """
@@ -149,3 +151,24 @@ class RiskManager:
             "is_paused": self.state.is_paused,
             "pause_reason": self.state.pause_reason,
         }
+
+    def _recover_daily_pnl(self):
+        """v11 #5: Recover today's PnL from the trade ledger on startup.
+        Prevents process restart from resetting the daily loss limit."""
+        try:
+            import sqlite3
+            from datetime import date
+            db_path = "data/paper_trades.db"
+            conn = sqlite3.connect(db_path)
+            today_str = date.today().isoformat()
+            cursor = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE date(timestamp) = ?",
+                (today_str,)
+            )
+            row = cursor.fetchone()
+            if row and row[0] != 0:
+                self.state.daily_pnl = float(row[0])
+                logger.info(f"v11 Recovered daily PnL from ledger: ${self.state.daily_pnl:+.2f}")
+            conn.close()
+        except Exception as e:
+            logger.debug(f"v11 PnL recovery failed (OK on first run): {e}")

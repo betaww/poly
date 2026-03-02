@@ -303,6 +303,21 @@ class SettlementVerifier:
                     f"({s.accuracy:.1%}) | mismatches={s.mismatches} | unresolved={s.unresolved}"
                 )
 
+            # v11 #11: Calibration curve periodic log (every 20 verified rounds)
+            if s.total_verified % 20 == 0 and s.total_verified > 0:
+                cal_lines = ["📊 Calibration curve:"]
+                for bin_label, bin_data in sorted(s.calibration_bins.items()):
+                    total = bin_data["total"]
+                    if total > 0:
+                        acc = bin_data["correct"] / total
+                        bar = "█" * int(acc * 20)
+                        cal_lines.append(
+                            f"  {bin_label}: {acc:.0%} ({bin_data['correct']}/{total}) {bar}"
+                        )
+                    else:
+                        cal_lines.append(f"  {bin_label}: — (no data)")
+                logger.info("\n".join(cal_lines))
+
     async def _fetch_actual_outcome(self, slug: str) -> tuple[str, float, float]:
         """Fetch the actual settlement from Polymarket Gamma API.
         

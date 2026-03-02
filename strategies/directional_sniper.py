@@ -82,6 +82,9 @@ class DirectionalSniper(BaseStrategy):
         # D3: Binance OFI (Order Flow Imbalance) signal
         self._ofi: float = 0.0  # -1.0 (strong sell) to +1.0 (strong buy)
 
+        # v11: CLOB best bid for maker pricing guard
+        self._clob_best_bid: float = 0.0
+
         # PnL tracking (directional inventory)
         self._buy_cost: float = 0.0
         self._shares_bought: float = 0.0
@@ -89,6 +92,21 @@ class DirectionalSniper(BaseStrategy):
 
         # E2: bankroll for Kelly sizing (can be set from config or live balance)
         self._bankroll: float = getattr(config.strategy, 'sniper_bankroll', 100.0)
+
+        # v11: Sharpe / drawdown / profit factor tracking
+        self._pnl_history: list[float] = []
+        self._peak_bankroll: float = self._bankroll
+        self._max_drawdown: float = 0.0
+        self._gross_wins: float = 0.0
+        self._gross_losses: float = 0.0
+
+        # v11: Last signal delta breakdown for analysis
+        self._last_d1: float = 0.0
+        self._last_d2: float = 0.0
+        self._last_d3: float = 0.0
+
+        # v11: Cross-asset correlation flag (set by vps_runner)
+        self._correlation_penalty: float = 1.0  # 1.0 = no penalty, 0.5 = halved
 
     # --- External setters (called by vps_runner) ---
 
@@ -117,6 +135,14 @@ class DirectionalSniper(BaseStrategy):
     def set_ofi(self, ofi: float):
         """D3: Set Binance Order Flow Imbalance signal."""
         self._ofi = max(-1.0, min(1.0, ofi))
+
+    def set_clob_best_bid(self, best_bid: float):
+        """v11: Set current CLOB best bid for maker pricing guard."""
+        self._clob_best_bid = best_bid
+
+    def set_correlation_penalty(self, penalty: float):
+        """v11: Set cross-asset correlation penalty (0.5 = halved size)."""
+        self._correlation_penalty = max(0.1, min(1.0, penalty))
 
     # --- Core logic ---
 
@@ -171,16 +197,16 @@ class DirectionalSniper(BaseStrategy):
                     d1_delta = -min(abs(trend) * 150, 0.40)  # max -10% conf equiv
 
         # D2: CLOB Bayesian fusion
-        # Skip when CLOB is in 0.45-0.55 "uninformed" zone
+        # clob_log_odds = ln(p_up/(1-p_up)): positive if CLOB favors Up
+        # For Up direction: positive CLOB LO → confirms → add
+        # For Down direction: positive CLOB LO → contradicts → subtract
         if (0.05 < self._clob_midpoint < 0.45) or (0.55 < self._clob_midpoint < 0.95):
             p_clob = self._clob_midpoint
             clob_log_odds = _to_log_odds(p_clob)
-            # D2 delta = half the CLOB log-odds deviation from 0.5 (prior)
-            # "half" because CLOB is a secondary signal, not equally trusted
             if direction == "Up":
-                d2_delta = clob_log_odds * 0.5  # positive if CLOB > 0.5
+                d2_delta = clob_log_odds * 0.5
             else:
-                d2_delta = -clob_log_odds * 0.5  # positive if CLOB < 0.5
+                d2_delta = -clob_log_odds * 0.5
 
         # D3: OFI confirmation
         if abs(self._ofi) > 0.2:
@@ -194,7 +220,10 @@ class DirectionalSniper(BaseStrategy):
         confidence = _from_log_odds(fused_log_odds)
         confidence = max(0.50, min(0.95, confidence))
 
-        # Diagnostic
+        # v11: Store delta decomposition for logging and analysis
+        self._last_d1 = d1_delta
+        self._last_d2 = d2_delta
+        self._last_d3 = d3_delta
         self._last_confidence = confidence
         self._last_z_score = base_conf  # store base for diagnostics
 
@@ -203,12 +232,13 @@ class DirectionalSniper(BaseStrategy):
     def _calculate_maker_price(self, confidence: float) -> float:
         """D5 FIX: Continuous maker price interpolation.
 
-        Old code used step function with $0.02 jumps at confidence boundaries.
-        New: linear interpolation from $0.50 (conf=0.50) to $0.70 (conf=0.95).
+        v11: Raised cap from $0.70 to $0.80 — high confidence signals were
+        being capped at $0.70 which systematically limited profits.
+        v11: Guard against accidentally taker-matching by checking CLOB best bid.
         """
         sc = self.config.strategy
         min_price = 0.50
-        max_price = 0.70
+        max_price = 0.80  # v11: was 0.70 — too restrictive for high conf
         min_conf = 0.50
         max_conf = 0.95
 
@@ -216,8 +246,15 @@ class DirectionalSniper(BaseStrategy):
         t = (confidence - min_conf) / max(max_conf - min_conf, 0.01)
         t = max(0.0, min(1.0, t))  # clamp to [0, 1]
         price = min_price + t * (max_price - min_price)
+        price = round(max(min_price, min(max_price, price)), 2)
 
-        return round(max(min_price, min(max_price, price)), 2)
+        # v11 #17: Ensure we don't accidentally cross the spread and become taker
+        # If our price >= CLOB best ask (approximated as 1 - best_bid for the
+        # complement token), cap at best_bid + 1 tick to stay as maker
+        if self._clob_best_bid > 0 and price > self._clob_best_bid:
+            price = round(min(price, self._clob_best_bid), 2)
+
+        return price
 
     def _kelly_size(self, confidence: float, maker_price: float) -> float:
         """
@@ -268,19 +305,51 @@ class DirectionalSniper(BaseStrategy):
 
     async def on_market_update(self, market: MarketInfo) -> list[Signal]:
         """
-        Main strategy loop — only fires in T-10s to T-5s window.
+        Main strategy loop — fires in dynamic commitment window.
+
+        v11: Dynamic window based on volatility (high vol = shorter window).
+        v11: T-5s to T-3s re-check: cancel order if direction reversed.
         """
         if self.should_pause():
             return []
 
         t = market.seconds_remaining
+        _t0 = time.time()  # v11 #14: pipeline timing
 
-        # --- BLACKOUT (T < 5s): too late for maker fills ---
-        if t < 5:
+        # --- BLACKOUT (T < 3s): too late even for cancel ---
+        if t < 3:
             return []
 
-        # --- OBSERVATION (T > 10s): just track direction stability ---
-        if t > 10:
+        # v11 #2: T-5s to T-3s RE-CHECK — cancel if direction reversed
+        if self._signal_sent and 3 <= t <= 5:
+            direction, _ = self._get_direction_confidence()
+            if direction != self._trade_direction and direction in ("Up", "Down"):
+                self._logger.info(
+                    f"⚠️ Direction reversed! {self._trade_direction}→{direction} at T-{t:.0f}s — cancel signal"
+                )
+                self._signal_sent = False
+                self._trade_direction = ""
+                # Return empty — vps_runner will call cancel_all() based on this
+                return [Signal(
+                    market=market,
+                    outcome=Outcome.UP,  # dummy
+                    side=Side.BUY,
+                    price=0.0,
+                    size_usd=0.0,
+                    confidence=0.0,
+                    reason="CANCEL:direction_reversed",
+                    order_type="CANCEL",
+                )]
+            return []
+
+        # v11 #4: Dynamic commitment window based on volatility
+        # High vol (>2%) → window starts at T-7s (less time for reversal)
+        # Low vol (<0.5%) → window starts at T-12s (can commit earlier)
+        vol_pct = self._volatility * 100  # e.g., 0.01 → 1.0%
+        window_start = max(7, min(12, int(10 / max(vol_pct, 0.3) * 1.0)))
+
+        # --- OBSERVATION (T > window_start): just track direction stability ---
+        if t > window_start:
             # Sample direction every 2 seconds for stability tracking
             now = time.time()
             if now - self._last_sample_time > 2.0:
@@ -296,17 +365,22 @@ class DirectionalSniper(BaseStrategy):
                     self._direction_samples.append(direction)
             return []
 
-        # --- COMMITMENT (T-10s to T-5s): fire if confident ---
+        # --- COMMITMENT (T-window to T-5s): fire if confident ---
         if self._signal_sent:
             return []
 
         direction, confidence = self._get_direction_confidence()
 
-        # A4 FIX: Log commitment window entry with pipeline details (was DEBUG, invisible)
+        # v11 #14: Pipeline timing
+        pipeline_ms = (time.time() - _t0) * 1000
+
+        # v11 #12: Log with D1/D2/D3 delta decomposition
         self._logger.info(
             f"⏱️ T-{t:.0f}s | cex=${self._cex_price:.2f} strike=${self._strike_price:.2f} "
             f"vol={self._volatility:.5f} | dir={direction} conf={confidence:.1%} | "
-            f"z={getattr(self, '_last_z_score', 0):.3f} clob={self._clob_midpoint:.3f}"
+            f"z={getattr(self, '_last_z_score', 0):.3f} clob={self._clob_midpoint:.3f} | "
+            f"d1={self._last_d1:+.3f} d2={self._last_d2:+.3f} d3={self._last_d3:+.3f} | "
+            f"{pipeline_ms:.1f}ms"
         )
 
         # E1: Bidirectional — trade both Up and Down
@@ -358,6 +432,10 @@ class DirectionalSniper(BaseStrategy):
         # E2: Kelly-sized order
         order_size = self._kelly_size(confidence, maker_price)
 
+        # v11 #15: Apply cross-asset correlation penalty
+        order_size = round(order_size * self._correlation_penalty, 2)
+        order_size = max(getattr(self.config.strategy, 'sniper_min_size', 5.0), order_size)
+
         # E1: Select outcome based on direction
         outcome = Outcome.UP if direction == "Up" else Outcome.DOWN
 
@@ -379,10 +457,11 @@ class DirectionalSniper(BaseStrategy):
 
         self._signal_sent = True
         self._trade_direction = direction  # E1: remember which direction we traded
+        corr_str = f" corr_pen={self._correlation_penalty:.1f}" if self._correlation_penalty < 1.0 else ""
         self._logger.info(
             f"🎯 SIGNAL: {direction} GTC@${maker_price:.2f} × ${order_size:.0f} | "
             f"conf={confidence:.1%} | T-{t:.0f}s | "
-            f"cex=${self._cex_price:.2f} vs strike=${self._strike_price:.2f}"
+            f"cex=${self._cex_price:.2f} vs strike=${self._strike_price:.2f}{corr_str}"
         )
 
         return [signal]
@@ -400,6 +479,8 @@ class DirectionalSniper(BaseStrategy):
         self._trade_direction = ""
         self._reversal_times = []  # D4
         self._clob_midpoint = 0.0  # D2
+        self._clob_best_bid = 0.0  # v11
+        self._correlation_penalty = 1.0  # v11: reset per round
         # D1: Do NOT reset EMAs — trend context is valuable across rounds
 
         if market.strike_price > 0:
@@ -446,8 +527,10 @@ class DirectionalSniper(BaseStrategy):
         if pnl > 0:
             self.state.rounds_won += 1
             self.state.consecutive_losses = 0
+            self._gross_wins += pnl
         elif pnl < 0:
             self.state.consecutive_losses += 1
+            self._gross_losses += abs(pnl)
 
         self.state.rounds_traded += 1
         self.state.reset_round()
@@ -455,14 +538,32 @@ class DirectionalSniper(BaseStrategy):
         # E2: Update bankroll for next round's Kelly calculation
         self._bankroll = max(10.0, self._bankroll + pnl)
 
+        # v11 #10: Track drawdown and PnL history
         if self._shares_bought > 0:
+            self._pnl_history.append(pnl)
+            if self._bankroll > self._peak_bankroll:
+                self._peak_bankroll = self._bankroll
+            dd = (self._peak_bankroll - self._bankroll) / self._peak_bankroll if self._peak_bankroll > 0 else 0
+            self._max_drawdown = max(self._max_drawdown, dd)
+
+        if self._shares_bought > 0:
+            # v11 #10: Compute running Sharpe (annualized per-round)
+            sharpe_str = ""
+            if len(self._pnl_history) >= 10:
+                import statistics
+                mu = statistics.mean(self._pnl_history)
+                sigma = statistics.stdev(self._pnl_history) if len(self._pnl_history) > 1 else 1.0
+                sharpe = mu / sigma if sigma > 0 else 0.0
+                pf = self._gross_wins / self._gross_losses if self._gross_losses > 0 else float('inf')
+                sharpe_str = f" | SR={sharpe:.2f} PF={pf:.1f} MDD={self._max_drawdown:.1%}"
+
             self._logger.info(
                 f"{outcome_emoji} Round PnL: ${pnl:+.2f} | "
                 f"dir={self._trade_direction} settled={settled_outcome} | "
                 f"{self._shares_bought:.1f}sh @${avg_cost:.3f} | "
                 f"Daily: ${self.state.daily_pnl_usd:+.2f} | "
                 f"Win rate: {self.state.win_rate:.1%} | "
-                f"Bankroll: ${self._bankroll:.0f}"
+                f"Bankroll: ${self._bankroll:.0f}{sharpe_str}"
             )
         else:
             self._logger.debug(f"Round skip (no fills) | settled={settled_outcome}")
