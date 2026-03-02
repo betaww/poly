@@ -324,22 +324,29 @@ class VPSRunner:
 
             await slot.strategy.on_round_start(market)
 
-            # BLIND SPOT FIX: Subscribe to CLOB orderbook for new market tokens
-            for token_id, (asset, outcome) in [
-                (market.token_id_up, (market.asset, "Up")),
-                (market.token_id_down, (market.asset, "Down")),
-            ]:
-                if token_id and token_id not in self._book_subscribed_tokens:
-                    self._book_subscribed_tokens.add(token_id)
-                    if not self._book_feed.is_connected:
-                        # First market: start the feed with initial tokens
-                        self._book_feed.start({
-                            market.token_id_up: (market.asset, "Up"),
-                            market.token_id_down: (market.asset, "Down"),
-                        })
-                    else:
-                        # Later market: subscribe additional tokens
-                        self._book_feed.subscribe_token(token_id, asset, outcome)
+        # FIX: Propagate dynamic strike to fresh market objects.
+        # discover_current_markets() returns new MarketInfo each cycle with strike=0
+        # because the "Up or Down" title has no dollar amount. The dynamic strike
+        # was set on slot.current_market during round transition — pass it through.
+        if market.strike_price <= 0 and slot.current_market and slot.current_market.strike_price > 0:
+            market.strike_price = slot.current_market.strike_price
+
+        # BLIND SPOT FIX: Subscribe to CLOB orderbook for new market tokens
+        for token_id, (asset, outcome) in [
+            (market.token_id_up, (market.asset, "Up")),
+            (market.token_id_down, (market.asset, "Down")),
+        ]:
+            if token_id and token_id not in self._book_subscribed_tokens:
+                self._book_subscribed_tokens.add(token_id)
+                if not self._book_feed.is_connected:
+                    # First market: start the feed with initial tokens
+                    self._book_feed.start({
+                        market.token_id_up: (market.asset, "Up"),
+                        market.token_id_down: (market.asset, "Down"),
+                    })
+                else:
+                    # Later market: subscribe additional tokens
+                    self._book_feed.subscribe_token(token_id, asset, outcome)
 
         if market.is_expired:
             await self._handle_round_end(slot, market)
