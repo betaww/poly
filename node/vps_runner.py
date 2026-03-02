@@ -41,6 +41,7 @@ from ..engine.settlement_verifier import SettlementVerifier
 from ..engine.binance_depth_feed import BinanceDepthFeed
 from ..engine.depth_feeds import MultiExchangeDepthFeeds
 from ..engine.lwba_engine import LWBAEngine
+from ..engine.lwba_calibrator import LWBACalibrator
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,8 @@ class VPSRunner:
         self._multi_depth = MultiExchangeDepthFeeds(config.market.assets)
         self._multi_depth.start()
         self._lwba = LWBAEngine(max_levels=20)
+        # v12: LWBA Calibrator — compare our LWBA vs Chainlink settlement
+        self._lwba_calibrator = LWBACalibrator()
         # E3: Wire CLOB feed into executor for real depth
         self._executor._clob_feed = self._book_feed
         # v10 FIX #14: Clock offset tracking (VPS vs Polymarket server)
@@ -732,6 +735,22 @@ class VPSRunner:
                 confidence=getattr(slot.strategy, '_last_confidence', 0.0),  # v10 FIX #10
             )
 
+            # v12: LWBA calibration snapshot
+            lwba_result = self._lwba.get_last_result(market.asset)
+            self._lwba_calibrator.snapshot_round(
+                slug=market.slug,
+                asset=market.asset,
+                strike=strike,
+                lwba_result=lwba_result,
+                cex_price=cex_price,
+                confidence=getattr(slot.strategy, '_last_confidence', 0.0),
+            )
+
+            # v12: Periodic LWBA calibration report (every 20 rounds)
+            if self._total_rounds % 20 == 0 and self._total_rounds > 0:
+                logger.info(f"\n{self._lwba_calibrator.get_accuracy_report()}")
+                logger.info(f"\n{self._lwba_calibrator.get_tuning_suggestions()}")
+
     async def _shutdown(self):
         await self._executor.cancel_all()
         await self._scanner.close()
@@ -741,9 +760,14 @@ class VPSRunner:
         self._multi_depth.stop()  # v12: Multi-exchange LWBA depth feeds
         await self._alerter.close()  # E8
         await self._verifier.close()
+        await self._lwba_calibrator.close()  # v12
 
         # Settlement verification summary
         logger.info(f"\n{self._verifier.get_summary()}")
+
+        # LWBA Calibration summary
+        logger.info(f"\n{self._lwba_calibrator.get_accuracy_report()}")
+        logger.info(f"\n{self._lwba_calibrator.get_tuning_suggestions()}")
 
         # Print per-strategy summary
         for slot in self._slots:
