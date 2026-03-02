@@ -169,11 +169,9 @@ class DirectionalSniper(BaseStrategy):
             confidence = fused_up if direction == "Up" else (1.0 - fused_up)
             confidence = max(0.50, min(0.95, confidence))
 
-        # Diagnostic: log pipeline stages
-        self._logger.debug(
-            f"Conf pipeline: z={conf_after_zscore:.3f} → D1={conf_after_d1:.3f} → D2={confidence:.3f} | "
-            f"dir={direction} clob={self._clob_midpoint:.3f} vol={self._volatility:.5f}"
-        )
+        # Diagnostic: log pipeline stages (only visible at INFO in commitment window)
+        self._last_confidence = confidence  # store for external access
+        self._last_z_score = conf_after_zscore  # store for diagnostics
 
         return direction, min(confidence, 0.95)
 
@@ -278,11 +276,19 @@ class DirectionalSniper(BaseStrategy):
 
         direction, confidence = self._get_direction_confidence()
 
+        # A4 FIX: Log commitment window entry with pipeline details (was DEBUG, invisible)
+        self._logger.info(
+            f"⏱️ T-{t:.0f}s | cex=${self._cex_price:.2f} strike=${self._strike_price:.2f} "
+            f"vol={self._volatility:.5f} | dir={direction} conf={confidence:.1%} | "
+            f"z={getattr(self, '_last_z_score', 0):.3f} clob={self._clob_midpoint:.3f}"
+        )
+
         # E1: Bidirectional — trade both Up and Down
         if direction not in ("Up", "Down"):
             if t <= 7:
                 self._signal_sent = True
-            self._logger.debug(
+            # A4 FIX: promote from DEBUG → INFO (was the silent killer)
+            self._logger.info(
                 f"Skip: direction={direction} conf={confidence:.1%} | "
                 f"cex=${self._cex_price:.2f} strike=${self._strike_price:.2f}"
             )

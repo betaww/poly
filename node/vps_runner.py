@@ -135,6 +135,9 @@ class VPSRunner:
         """Push brain predictions into strategy."""
         pred = self._redis.get_prediction(market.asset)
         if pred is None:
+            # A4 FIX: log when Brain data is missing
+            if market.seconds_remaining < 12:  # only log near commitment window
+                logger.warning(f"⚠️ No prediction for {slot.name} ({market.asset}) | T-{market.seconds_remaining:.0f}s")
             return
 
         strat = slot.strategy
