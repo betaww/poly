@@ -37,6 +37,7 @@ from ..strategies.directional_sniper import DirectionalSniper
 from ..engine.clob_book_feed import CLOBBookFeed
 from ..engine.alerting import AlertManager
 from ..engine.analytics import PerformanceAnalytics
+from ..engine.settlement_verifier import SettlementVerifier
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,8 @@ class VPSRunner:
         self._coinflip_count: int = 0
         # E4: Performance analytics
         self._analytics = PerformanceAnalytics()
+        # Settlement verifier: compare paper vs Polymarket actual
+        self._verifier = SettlementVerifier()
         # E3: Wire CLOB feed into executor for real depth
         self._executor._clob_feed = self._book_feed
 
@@ -536,12 +539,27 @@ class VPSRunner:
             order_size=slot.round_cost,
         )
 
+        # Schedule settlement verification against Polymarket actual outcome
+        if market.slug and cex_price > 0 and strike > 0:
+            self._verifier.schedule_verification(
+                slug=market.slug,
+                asset=market.asset,
+                paper_settlement=settled,
+                paper_cex_price=cex_price,
+                paper_strike=strike,
+                strategy=slot.name,
+            )
+
     async def _shutdown(self):
         await self._executor.cancel_all()
         await self._scanner.close()
         self._redis.stop()
         self._book_feed.stop()
         await self._alerter.close()  # E8
+        await self._verifier.close()
+
+        # Settlement verification summary
+        logger.info(f"\n{self._verifier.get_summary()}")
 
         # Print per-strategy summary
         for slot in self._slots:
