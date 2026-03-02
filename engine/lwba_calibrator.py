@@ -257,6 +257,9 @@ class LWBACalibrator:
 
         self._update_actual(snap.slug, actual, snap.lwba_match, snap.cex_match)
         self._snapshots.append(snap)
+        # Cap in-memory snapshots to prevent unbounded growth (~280/day)
+        if len(self._snapshots) > 500:
+            self._snapshots = self._snapshots[-500:]
 
         # Log individual result
         lwba_icon = "✅" if snap.lwba_match else "❌"
