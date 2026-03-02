@@ -39,6 +39,8 @@ from ..engine.alerting import AlertManager
 from ..engine.analytics import PerformanceAnalytics
 from ..engine.settlement_verifier import SettlementVerifier
 from ..engine.binance_depth_feed import BinanceDepthFeed
+from ..engine.depth_feeds import MultiExchangeDepthFeeds
+from ..engine.lwba_engine import LWBAEngine
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,10 @@ class VPSRunner:
         # D3: Binance L2 depth feed for OFI signal
         self._depth_feed = BinanceDepthFeed()
         self._depth_feed.start(config.market.assets)
+        # v12: Multi-exchange L2 depth + LWBA shadow price
+        self._multi_depth = MultiExchangeDepthFeeds(config.market.assets)
+        self._multi_depth.start()
+        self._lwba = LWBAEngine(max_levels=20)
         # E3: Wire CLOB feed into executor for real depth
         self._executor._clob_feed = self._book_feed
         # v10 FIX #14: Clock offset tracking (VPS vs Polymarket server)
@@ -225,6 +231,27 @@ class VPSRunner:
         if hasattr(strat, 'set_ofi'):
             ofi = self._depth_feed.get_ofi(market.asset)
             strat.set_ofi(ofi)
+
+        # v12: LWBA shadow price — replicate Chainlink settlement price
+        books = self._multi_depth.get_all_books(market.asset)
+        if books:
+            lwba = self._lwba.aggregate(books, asset=market.asset)
+            if lwba.is_valid:
+                if hasattr(strat, 'set_lwba_shadow_price'):
+                    strat.set_lwba_shadow_price(lwba.mid)
+                if hasattr(strat, 'set_lwba_spread'):
+                    strat.set_lwba_spread(lwba.spread_bps)
+                # Log LWBA periodically (every ~10s for each asset)
+                if market.seconds_remaining % 10 < 2:
+                    mids_str = " ".join(
+                        f"{ex}=${m:,.2f}" for ex, m in lwba.exchange_mids.items()
+                    )
+                    logger.info(
+                        f"LWBA {market.asset.upper()}: shadow=${lwba.mid:,.2f} "
+                        f"bid=${lwba.bid:,.2f} ask=${lwba.ask:,.2f} "
+                        f"spread={lwba.spread_bps:.1f}bps "
+                        f"sources={lwba.n_sources} | {mids_str}"
+                    )
 
     async def _vps_fallback_cex_price(self, asset: str) -> float:
         """v10 FIX #12: Lightweight VPS-side oracle fallback when Brain is offline.

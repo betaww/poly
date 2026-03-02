@@ -104,9 +104,14 @@ class DirectionalSniper(BaseStrategy):
         self._last_d1: float = 0.0
         self._last_d2: float = 0.0
         self._last_d3: float = 0.0
+        self._last_d4: float = 0.0  # v12: LWBA spread delta
 
         # v11: Cross-asset correlation flag (set by vps_runner)
         self._correlation_penalty: float = 1.0  # 1.0 = no penalty, 0.5 = halved
+
+        # v12: LWBA shadow price (Chainlink settlement replica)
+        self._lwba_shadow_price: float = 0.0  # LWBA Mid from multi-exchange depth
+        self._lwba_spread_bps: float = 0.0    # LWBA spread in basis points
 
     # --- External setters (called by vps_runner) ---
 
@@ -144,6 +149,15 @@ class DirectionalSniper(BaseStrategy):
         """v11: Set cross-asset correlation penalty (0.5 = halved size)."""
         self._correlation_penalty = max(0.1, min(1.0, penalty))
 
+    def set_lwba_shadow_price(self, price: float):
+        """v12: Set LWBA shadow price (Chainlink settlement replica)."""
+        if price > 0:
+            self._lwba_shadow_price = price
+
+    def set_lwba_spread(self, spread_bps: float):
+        """v12: Set LWBA bid-ask spread in basis points."""
+        self._lwba_spread_bps = spread_bps
+
     # --- Core logic ---
 
     def _get_direction_confidence(self) -> tuple[str, float]:
@@ -160,7 +174,11 @@ class DirectionalSniper(BaseStrategy):
         if self._cex_price <= 0 or self._strike_price <= 0:
             return "Unknown", 0.0
 
-        distance = (self._cex_price - self._strike_price) / self._strike_price
+        # v12: Use LWBA shadow price if available (matches Chainlink settlement)
+        # Fallback to CEX spot if LWBA unavailable
+        effective_price = self._lwba_shadow_price if self._lwba_shadow_price > 0 else self._cex_price
+
+        distance = (effective_price - self._strike_price) / self._strike_price
         abs_distance = abs(distance)
 
         # v10 FIX #1: Widened deadzone (was 0.00005 = 0.005%)
@@ -217,6 +235,18 @@ class DirectionalSniper(BaseStrategy):
 
         # Fuse in log-odds space and convert back
         fused_log_odds = base_log_odds + d1_delta + d2_delta + d3_delta
+
+        # v12: LWBA spread confidence modifier
+        # Narrow spread (< 3 bps) → +2% confidence (market is liquid/certain)
+        # Wide spread (> 10 bps) → -5% confidence (market is uncertain)
+        d4_delta = 0.0
+        if self._lwba_spread_bps > 0:
+            if self._lwba_spread_bps < 3.0:
+                d4_delta = 0.10   # narrow → bonus
+            elif self._lwba_spread_bps > 10.0:
+                d4_delta = -0.20  # wide → penalty
+            fused_log_odds += d4_delta
+
         confidence = _from_log_odds(fused_log_odds)
         confidence = max(0.50, min(0.95, confidence))
 
@@ -224,6 +254,7 @@ class DirectionalSniper(BaseStrategy):
         self._last_d1 = d1_delta
         self._last_d2 = d2_delta
         self._last_d3 = d3_delta
+        self._last_d4 = d4_delta # v12: LWBA spread delta
         self._last_confidence = confidence
         self._last_z_score = base_conf  # store base for diagnostics
 
