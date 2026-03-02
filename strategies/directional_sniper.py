@@ -405,13 +405,15 @@ class DirectionalSniper(BaseStrategy):
         # v11 #14: Pipeline timing
         pipeline_ms = (time.time() - _t0) * 1000
 
-        # v11 #12: Log with D1/D2/D3 delta decomposition
+        # v11 #12: Log with D1/D2/D3/D4 delta decomposition
+        px_src = "lwba" if self._lwba_shadow_price > 0 else "cex"
         self._logger.info(
-            f"⏱️ T-{t:.0f}s | cex=${self._cex_price:.2f} strike=${self._strike_price:.2f} "
+            f"⏱️ T-{t:.0f}s | {px_src}=${self._lwba_shadow_price if self._lwba_shadow_price > 0 else self._cex_price:.2f} "
+            f"strike=${self._strike_price:.2f} "
             f"vol={self._volatility:.5f} | dir={direction} conf={confidence:.1%} | "
             f"z={getattr(self, '_last_z_score', 0):.3f} clob={self._clob_midpoint:.3f} | "
-            f"d1={self._last_d1:+.3f} d2={self._last_d2:+.3f} d3={self._last_d3:+.3f} | "
-            f"{pipeline_ms:.1f}ms"
+            f"d1={self._last_d1:+.3f} d2={self._last_d2:+.3f} d3={self._last_d3:+.3f} d4={self._last_d4:+.3f} | "
+            f"spread={self._lwba_spread_bps:.1f}bps | {pipeline_ms:.1f}ms"
         )
 
         # E1: Bidirectional — trade both Up and Down
@@ -512,6 +514,8 @@ class DirectionalSniper(BaseStrategy):
         self._clob_midpoint = 0.0  # D2
         self._clob_best_bid = 0.0  # v11
         self._correlation_penalty = 1.0  # v11: reset per round
+        self._lwba_shadow_price = 0.0  # v12: reset LWBA shadow price
+        self._lwba_spread_bps = 0.0    # v12: reset spread
         # D1: Do NOT reset EMAs — trend context is valuable across rounds
 
         if market.strike_price > 0:

@@ -738,6 +738,7 @@ class VPSRunner:
         self._redis.stop()
         self._book_feed.stop()
         self._depth_feed.stop()  # D3: Binance OFI feed
+        self._multi_depth.stop()  # v12: Multi-exchange LWBA depth feeds
         await self._alerter.close()  # E8
         await self._verifier.close()
 
