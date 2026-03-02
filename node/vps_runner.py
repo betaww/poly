@@ -266,12 +266,16 @@ class VPSRunner:
         if not markets:
             return
 
-        # H6 FIX: Pick best market for EACH configured asset (not just primary)
+        # FIX: Pick the NEAREST expiring market per asset (not farthest).
+        # Old logic picked market with most time → when current market reached
+        # T-10s, scanner already returned next market (300s) → slug changed →
+        # round transition → Sniper's commitment window (T-10 to T-5) was NEVER hit.
+        # Now: pick market with LEAST remaining time, but still > 0 (not expired).
         best_markets: dict[str, MarketInfo] = {}
         for m in markets:
             if m.is_expired:
                 continue
-            if m.asset not in best_markets or m.seconds_remaining > best_markets[m.asset].seconds_remaining:
+            if m.asset not in best_markets or m.seconds_remaining < best_markets[m.asset].seconds_remaining:
                 best_markets[m.asset] = m
 
         if not best_markets:
