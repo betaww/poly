@@ -124,6 +124,12 @@ class DirectionalSniper(BaseStrategy):
             self._ema_slow = price
             self._ema_initialized = True
         elif self._ema_initialized:
+            # v12: Skip EMA update here when LWBA is active — set_lwba_shadow_price
+            # handles EMA to keep trend aligned with effective_price. Without this
+            # guard, both setters update EMA → double-smoothing (halved half-life).
+            # Note: we still allow EMA INIT above — only skip ongoing updates.
+            if self._lwba_shadow_price > 0:
+                return  # EMA will be updated by set_lwba_shadow_price
             self._ema_fast = 0.95 * self._ema_fast + 0.05 * price   # α=0.05 (half-life ~14s)
             self._ema_slow = 0.99 * self._ema_slow + 0.01 * price   # α=0.01 (half-life ~70s)
 
@@ -150,9 +156,17 @@ class DirectionalSniper(BaseStrategy):
         self._correlation_penalty = max(0.1, min(1.0, penalty))
 
     def set_lwba_shadow_price(self, price: float):
-        """v12: Set LWBA shadow price (Chainlink settlement replica)."""
+        """v12: Set LWBA shadow price (Chainlink settlement replica).
+
+        Also updates EMA with LWBA price since direction is now based on
+        LWBA — keeps D1 trend signal aligned with direction signal.
+        """
         if price > 0:
             self._lwba_shadow_price = price
+            # Feed LWBA into EMA so trend tracks effective_price, not just CEX
+            if self._ema_initialized:
+                self._ema_fast = 0.95 * self._ema_fast + 0.05 * price
+                self._ema_slow = 0.99 * self._ema_slow + 0.01 * price
 
     def set_lwba_spread(self, spread_bps: float):
         """v12: Set LWBA bid-ask spread in basis points."""

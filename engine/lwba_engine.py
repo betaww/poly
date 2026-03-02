@@ -173,10 +173,10 @@ class LWBAEngine:
         spread_bps = (spread / final_mid * 10000) if final_mid > 0 else 0.0
 
         result = LWBAResult(
-            bid=round(final_bid, 2),
-            ask=round(final_ask, 2),
-            mid=round(final_mid, 2),
-            spread=round(spread, 2),
+            bid=round(final_bid, 8),
+            ask=round(final_ask, 8),
+            mid=round(final_mid, 8),
+            spread=round(spread, 8),
             spread_bps=round(spread_bps, 2),
             n_sources=len(bids),
             timestamp=now,

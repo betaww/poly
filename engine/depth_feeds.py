@@ -240,36 +240,61 @@ class CoinbaseDepthStream(_ExchangeDepthStream):
         if not asset:
             return
 
-        if msg_type == "snapshot":
-            # Full orderbook snapshot
-            self._full_bids[asset] = {
-                float(p): float(q) for p, q in msg.get("bids", [])
-            }
-            self._full_asks[asset] = {
-                float(p): float(q) for p, q in msg.get("asks", [])
-            }
-        elif msg_type == "l2update":
-            # Incremental updates
-            for change in msg.get("changes", []):
-                side, price_str, qty_str = change[0], change[1], change[2]
-                price = float(price_str)
-                qty = float(qty_str)
-                book = self._full_bids[asset] if side == "buy" else self._full_asks[asset]
-                if qty == 0:
-                    book.pop(price, None)
-                else:
-                    book[price] = qty
-        else:
-            return
+        # Thread safety: lock around _full_bids/_full_asks mutation
+        # Without this, main thread could read a half-updated dict
+        with self._lock:
+            if msg_type == "snapshot":
+                # Full orderbook snapshot
+                self._full_bids[asset] = {
+                    float(p): float(q) for p, q in msg.get("bids", [])
+                }
+                self._full_asks[asset] = {
+                    float(p): float(q) for p, q in msg.get("asks", [])
+                }
+                # Prune to top 500 levels to prevent unbounded memory growth
+                # (BTC L2 can have 10k+ levels; we only need top 20 for LWBA)
+                self._prune_book(asset)
+            elif msg_type == "l2update":
+                # Incremental updates
+                for change in msg.get("changes", []):
+                    side, price_str, qty_str = change[0], change[1], change[2]
+                    price = float(price_str)
+                    qty = float(qty_str)
+                    book = self._full_bids[asset] if side == "buy" else self._full_asks[asset]
+                    if qty == 0:
+                        book.pop(price, None)
+                    else:
+                        book[price] = qty
+            else:
+                return
 
-        # Build sorted snapshot (top 20 levels)
-        sorted_bids = sorted(
-            self._full_bids[asset].items(), key=lambda x: x[0], reverse=True
-        )[:20]
-        sorted_asks = sorted(
-            self._full_asks[asset].items(), key=lambda x: x[0]
-        )[:20]
+            # Build sorted snapshot (top 20 levels)
+            sorted_bids = sorted(
+                self._full_bids[asset].items(), key=lambda x: x[0], reverse=True
+            )[:20]
+            sorted_asks = sorted(
+                self._full_asks[asset].items(), key=lambda x: x[0]
+            )[:20]
+
+        # _update_book acquires lock again, but we've released it above
         self._update_book(asset, sorted_bids, sorted_asks)
+
+    def _prune_book(self, asset: str):
+        """Prune full book to top 500 levels per side to cap memory.
+
+        BTC L2 can have 10k+ levels. We only need top 20 for LWBA,
+        but keep 500 as buffer for incremental updates.
+        """
+        MAX_LEVELS = 500
+        bids = self._full_bids.get(asset, {})
+        if len(bids) > MAX_LEVELS:
+            top_prices = sorted(bids.keys(), reverse=True)[:MAX_LEVELS]
+            self._full_bids[asset] = {p: bids[p] for p in top_prices}
+
+        asks = self._full_asks.get(asset, {})
+        if len(asks) > MAX_LEVELS:
+            top_prices = sorted(asks.keys())[:MAX_LEVELS]
+            self._full_asks[asset] = {p: asks[p] for p in top_prices}
 
 
 # ─── Aggregator ──────────────────────────────────────────────────────────────
