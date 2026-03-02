@@ -273,15 +273,24 @@ class LWBACalibrator:
         )
 
     async def _fetch_actual(self, slug: str) -> str:
-        """Fetch actual settlement direction from Gamma API."""
+        """Fetch actual settlement direction from Gamma API.
+
+        Uses /events endpoint (same as SettlementVerifier) since our slugs
+        are event-level (e.g., btc-updown-5m-1772466900).
+        """
         try:
             resp = await self._client.get(
-                f"{GAMMA_API}/markets",
-                params={"slug": slug, "closed": "true"},
+                f"{GAMMA_API}/events",
+                params={"slug": slug},
             )
             if resp.status_code != 200:
                 return "Unknown"
-            markets = resp.json()
+            data = resp.json()
+            if not isinstance(data, list) or len(data) == 0:
+                return "Unknown"
+
+            event = data[0]
+            markets = event.get("markets", [])
             if not markets:
                 return "Unknown"
 
@@ -297,9 +306,9 @@ class LWBACalibrator:
             if len(outcomes) >= 2:
                 up_price = float(outcomes[0])
                 down_price = float(outcomes[1])
-                if up_price > 0.9:
+                if up_price >= 0.95:
                     return "Up"
-                elif down_price > 0.9:
+                elif down_price >= 0.95:
                     return "Down"
             return "Unknown"
         except Exception:
