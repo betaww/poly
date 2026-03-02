@@ -227,15 +227,32 @@ class LWBACalibrator:
         self._persist(snap)
 
         # Schedule delayed verification
-        task = asyncio.create_task(
-            self._verify_after_delay(snap)
-        )
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        try:
+            task = asyncio.create_task(
+                self._verify_after_delay(snap)
+            )
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._task_done)
+            logger.debug(f"LWBA Cal: scheduled verification for {snap.slug}")
+        except RuntimeError as e:
+            logger.warning(f"LWBA Cal: failed to create verify task: {e}")
+
+    def _task_done(self, task: asyncio.Task):
+        """Callback for completed verification tasks — log any exceptions."""
+        self._pending_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.warning(f"LWBA Cal: verification task failed: {exc}")
 
     async def _verify_after_delay(self, snap: CalibrationSnapshot):
         """Wait for settlement, then compare."""
-        await asyncio.sleep(VERIFICATION_DELAY_S)
+        try:
+            await asyncio.sleep(VERIFICATION_DELAY_S)
+        except asyncio.CancelledError:
+            logger.debug(f"LWBA Cal: verify task canceled for {snap.slug}")
+            return
 
         actual = "Unknown"
         for attempt in range(MAX_RETRIES):
@@ -244,7 +261,7 @@ class LWBACalibrator:
                 if actual != "Unknown":
                     break
             except Exception as e:
-                logger.debug(f"LWBA Cal: fetch failed for {snap.slug}: {e}")
+                logger.warning(f"LWBA Cal: fetch failed for {snap.slug} (attempt {attempt+1}): {e}")
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY_S)
 
