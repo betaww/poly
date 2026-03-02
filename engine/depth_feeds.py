@@ -206,7 +206,8 @@ class CoinbaseDepthStream(_ExchangeDepthStream):
 
         while self._running:
             try:
-                async with websockets.connect(url, ping_interval=20) as ws:
+                # Coinbase L2 snapshot for BTC can be ~1.04MB — raise limit
+                async with websockets.connect(url, ping_interval=20, max_size=10_000_000) as ws:
                     await ws.send(json.dumps({
                         "type": "subscribe",
                         "product_ids": product_ids,
