@@ -38,6 +38,7 @@ from ..engine.clob_book_feed import CLOBBookFeed
 from ..engine.alerting import AlertManager
 from ..engine.analytics import PerformanceAnalytics
 from ..engine.settlement_verifier import SettlementVerifier
+from ..engine.binance_depth_feed import BinanceDepthFeed
 from .redis_consumer import RedisConsumer
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,9 @@ class VPSRunner:
         self._analytics = PerformanceAnalytics()
         # Settlement verifier: compare paper vs Polymarket actual
         self._verifier = SettlementVerifier()
+        # D3: Binance L2 depth feed for OFI signal
+        self._depth_feed = BinanceDepthFeed()
+        self._depth_feed.start(config.market.assets)
         # E3: Wire CLOB feed into executor for real depth
         self._executor._clob_feed = self._book_feed
 
@@ -175,6 +179,11 @@ class VPSRunner:
         # D2: Pass CLOB Up token midpoint to sniper for Bayesian fusion
         if hasattr(strat, 'set_clob_midpoint') and book_up:
             strat.set_clob_midpoint(book_up.midpoint)
+
+        # D3: Pass Binance OFI signal to sniper
+        if hasattr(strat, 'set_ofi'):
+            ofi = self._depth_feed.get_ofi(market.asset)
+            strat.set_ofi(ofi)
 
         # Track predicted direction for round recording
         if pred.cex_price > 0 and market.strike_price > 0:
@@ -555,6 +564,7 @@ class VPSRunner:
         await self._scanner.close()
         self._redis.stop()
         self._book_feed.stop()
+        self._depth_feed.stop()  # D3: Binance OFI feed
         await self._alerter.close()  # E8
         await self._verifier.close()
 

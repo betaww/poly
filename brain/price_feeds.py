@@ -219,6 +219,92 @@ class OKXFeed:
         self._running = False
 
 
+class KalmanPriceFilter:
+    """Adaptive Kalman filter for multi-source price fusion.
+
+    Treats each CEX as a sensor with independent measurement noise.
+    Dynamically adjusts per-source noise covariance based on innovation
+    (prediction error). Uses Chainlink as ground-truth correction.
+    """
+
+    def __init__(self, config: Config):
+        # State estimate and variance
+        self.x_hat: float = 0.0       # estimated true price
+        self.P: float = 1.0           # estimate variance
+        self.Q: float = 0.0001        # process noise (price drift per tick)
+
+        # Per-source measurement noise (initialized from config weights)
+        # Lower weight → higher initial noise
+        self._R: dict[str, float] = {}
+        for source, weight in config.oracle.weights.items():
+            if weight > 0:
+                # Higher weight → lower R (more trusted)
+                self._R[source] = max(0.01, 1.0 / (weight * 100))
+
+        self._initialized = False
+
+    def update(self, source: str, price: float):
+        """Kalman update with a sensor measurement."""
+        if price <= 0:
+            return
+
+        if not self._initialized:
+            self.x_hat = price
+            self.P = 1.0
+            self._initialized = True
+            return
+
+        R = self._R.get(source, 1.0)
+
+        # Predict step (simple random walk model)
+        x_pred = self.x_hat
+        P_pred = self.P + self.Q
+
+        # Innovation (measurement residual)
+        innovation = price - x_pred
+
+        # Innovation variance
+        S = P_pred + R
+
+        # Kalman gain
+        K = P_pred / S if S > 0 else 0.0
+
+        # State update
+        self.x_hat = x_pred + K * innovation
+        self.P = (1.0 - K) * P_pred
+
+        # Adaptive R: adjust noise based on squared innovation
+        # If this source consistently has large innovations, increase R
+        alpha = 0.05  # adaptation rate
+        self._R[source] = (1 - alpha) * R + alpha * (innovation ** 2)
+
+    def correct_with_ground_truth(self, chainlink_price: float):
+        """Use Chainlink as ground-truth to correct state and recalibrate."""
+        if chainlink_price <= 0 or not self._initialized:
+            return
+
+        # Strong correction: treat Chainlink as very low-noise measurement
+        R_cl = 0.001
+        P_pred = self.P + self.Q
+        innovation = chainlink_price - self.x_hat
+        S = P_pred + R_cl
+        K = P_pred / S if S > 0 else 0.0
+        self.x_hat = self.x_hat + K * innovation
+        self.P = (1.0 - K) * P_pred
+
+    @property
+    def price(self) -> float:
+        return self.x_hat if self._initialized else 0.0
+
+    @property
+    def confidence_from_variance(self) -> float:
+        """Higher confidence when estimate variance is low."""
+        if self.P <= 0:
+            return 0.99
+        # Map variance to 0.3-0.99 confidence
+        return max(0.3, min(0.99, 1.0 - self.P * 10))
+
+
 class SyntheticOracle:
     """
     Weighted median price aggregator aligned with Chainlink Data Streams.
@@ -238,12 +324,14 @@ class SyntheticOracle:
         self.update_times: dict[str, float] = {}
         self._prediction_history: deque = deque(maxlen=300)  # M8 FIX: bounded deque
         # P5: Raw tick deque for accurate volatility calculation
-        self._raw_ticks: deque = deque(maxlen=500)
+        self._raw_ticks: deque = deque(maxlen=3000)  # 5 min @ ~10 ticks/sec
         # P6: Per-exchange latency tracking
         self._exchange_latencies: dict[str, deque] = {}
         # Chainlink drift detection
         self._chainlink_price: float = 0.0
         self._chainlink_updated_at: float = 0.0
+        # Kalman filter for adaptive price fusion
+        self._kalman = KalmanPriceFilter(config)
 
     def update(self, tick: PriceTick):
         """Process a new price tick."""
@@ -264,6 +352,12 @@ class SyntheticOracle:
                 if tick.exchange not in self._exchange_latencies:
                     self._exchange_latencies[tick.exchange] = deque(maxlen=100)
                 self._exchange_latencies[tick.exchange].append(latency_ms)
+
+        # Kalman filter: update with sensor measurement or ground-truth
+        if tick.exchange == 'chainlink':
+            self._kalman.correct_with_ground_truth(tick.price)
+        elif tick.price > 0:
+            self._kalman.update(tick.exchange, tick.price)
 
     def _weighted_median(self, prices_weights: list[tuple[float, float]]) -> float:
         """Compute weighted median — matches Chainlink's median-of-medians logic.
@@ -328,7 +422,15 @@ class SyntheticOracle:
             return 0.0, 0.0
 
         # WEIGHTED MEDIAN — matches Chainlink's aggregation algorithm
-        predicted = self._weighted_median(prices_weights)
+        wm_predicted = self._weighted_median(prices_weights)
+
+        # Kalman-weighted median fusion: use Kalman as primary when initialized
+        kalman_price = self._kalman.price
+        if kalman_price > 0 and wm_predicted > 0:
+            # Blend: 70% Kalman (adaptive) + 30% weighted median (robust)
+            predicted = 0.7 * kalman_price + 0.3 * wm_predicted
+        else:
+            predicted = wm_predicted
 
         # P4 FIX: Use MAD (Median Absolute Deviation) for confidence
         active_prices = [p for p, _ in prices_weights]
@@ -375,48 +477,51 @@ class SyntheticOracle:
         return predicted, min(confidence, 0.99)
 
     def get_volatility(self) -> float:
-        """P5 FIX + M4 FIX: Time-sampled volatility from raw ticks.
+        """Parkinson volatility estimator using High-Low extremes.
 
-        M4 FIX: Uses 1-second time sampling instead of tick-by-tick returns.
-        This prevents Coinbase's high tick rate (400-600/min) from dominating
-        the volatility estimate over Binance's lower rate (~60/min).
+        Uses 5-second OHLC micro-slices over up to 5 minutes.
+        Parkinson estimator: σ = sqrt(1/(4n·ln2) · Σ ln²(H_i/L_i))
+        ~5x more efficient than close-to-close standard deviation,
+        and immune to bid-ask bounce microstructure noise.
         """
-        # M4 FIX: Time-sampled volatility (1-second intervals)
-        if len(self._raw_ticks) >= 10:
-            recent = list(self._raw_ticks)[-300:]  # last ~60s of ticks
-            if len(recent) >= 2:
-                # Build 1-second OHLC-style samples: use last price per second
-                second_prices: dict[int, float] = {}
-                for ts, price in recent:
-                    sec = int(ts)
-                    second_prices[sec] = price  # last tick wins per second
-                sorted_secs = sorted(second_prices.keys())
-                if len(sorted_secs) >= 5:
-                    prices_1s = [second_prices[s] for s in sorted_secs]
-                    returns = [
-                        (prices_1s[i] - prices_1s[i-1]) / prices_1s[i-1]
-                        for i in range(1, len(prices_1s))
-                        if prices_1s[i-1] != 0
-                    ]
-                    if returns:
-                        variance = sum(r**2 for r in returns) / len(returns)
-                        return max(0.001, variance ** 0.5)
+        if len(self._raw_ticks) < 10:
+            return 0.01
 
-        # Fallback: use prediction history
-        if len(self._prediction_history) < 10:
+        recent = list(self._raw_ticks)
+        now = time.time()
+        # Use last 5 minutes of ticks
+        cutoff = now - 300
+        recent = [(ts, p) for ts, p in recent if ts >= cutoff]
+
+        if len(recent) < 10:
             return 0.01
-        recent = list(self._prediction_history)[-60:]
-        if len(recent) < 2:
+
+        # Build 5-second OHLC bars
+        bars: dict[int, dict] = {}  # bar_id -> {o, h, l, c}
+        for ts, price in recent:
+            bar_id = int(ts) // 5  # 5-second bars
+            if bar_id not in bars:
+                bars[bar_id] = {'o': price, 'h': price, 'l': price, 'c': price}
+            else:
+                bars[bar_id]['h'] = max(bars[bar_id]['h'], price)
+                bars[bar_id]['l'] = min(bars[bar_id]['l'], price)
+                bars[bar_id]['c'] = price
+
+        if len(bars) < 3:
             return 0.01
-        mean = sum(recent) / len(recent)
-        if mean == 0:
-            return 0.01
-        returns = [(recent[i] - recent[i-1]) / recent[i-1]
-                    for i in range(1, len(recent)) if recent[i-1] != 0]
-        if not returns:
-            return 0.01
-        variance = sum(r**2 for r in returns) / len(returns)
-        return max(0.001, variance ** 0.5)
+
+        # Parkinson estimator: σ² = 1/(4n·ln2) · Σ [ln(H/L)]²
+        n = len(bars)
+        sum_hl_sq = 0.0
+        for bar in bars.values():
+            if bar['l'] > 0:
+                hl_ratio = bar['h'] / bar['l']
+                sum_hl_sq += math.log(hl_ratio) ** 2
+
+        parkinson_var = sum_hl_sq / (4.0 * n * math.log(2))
+        vol = max(0.001, parkinson_var ** 0.5)
+
+        return vol
 
     def get_direction(self, strike_price: float) -> tuple[str, float]:
         """C2 FIX: Predict settlement direction relative to strike.

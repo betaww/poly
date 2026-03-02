@@ -28,6 +28,8 @@ import math
 import time
 from typing import Optional
 
+from scipy.stats import t as t_dist
+
 from .base import BaseStrategy, Signal, Side, Outcome
 from ..config import Config
 from ..market_scanner import MarketInfo
@@ -68,6 +70,9 @@ class DirectionalSniper(BaseStrategy):
         # D2: CLOB midpoint for Bayesian fusion
         self._clob_midpoint: float = 0.0  # Up token midpoint from CLOB
 
+        # D3: Binance OFI (Order Flow Imbalance) signal
+        self._ofi: float = 0.0  # -1.0 (strong sell) to +1.0 (strong buy)
+
         # PnL tracking (directional inventory)
         self._buy_cost: float = 0.0
         self._shares_bought: float = 0.0
@@ -99,6 +104,10 @@ class DirectionalSniper(BaseStrategy):
         """D2: Set CLOB Up token midpoint for Bayesian fusion."""
         self._clob_midpoint = midpoint
 
+    def set_ofi(self, ofi: float):
+        """D3: Set Binance Order Flow Imbalance signal."""
+        self._ofi = max(-1.0, min(1.0, ofi))
+
     # --- Core logic ---
 
     def _get_direction_confidence(self) -> tuple[str, float]:
@@ -128,16 +137,11 @@ class DirectionalSniper(BaseStrategy):
         vol = max(self._volatility, 0.001)
         z_score = abs_distance / vol  # "standard deviations" of move
 
-        if z_score > 3.0:            # 3+ sigma — very strong signal
-            confidence = 0.90 + min(z_score - 3.0, 0.05)  # 90-95%
-        elif z_score > 2.0:          # 2-3 sigma — solid signal
-            confidence = 0.80 + (z_score - 2.0) * 0.10     # 80-90%
-        elif z_score > 1.0:          # 1-2 sigma — moderate signal
-            confidence = 0.65 + (z_score - 1.0) * 0.15     # 65-80%
-        elif z_score > 0.5:          # 0.5-1 sigma — weak signal
-            confidence = 0.55 + (z_score - 0.5) * 0.20     # 55-65%
-        else:
-            confidence = 0.50 + z_score * 0.10              # 50-55%
+        # Student-t CDF (df=4): fat-tail correction for 5-min crypto returns.
+        # Normal CDF systematically underestimates extreme event probability;
+        # t(4) has heavier tails, matching empirical 5-min BTC return distribution.
+        raw_conf = t_dist.cdf(z_score, df=4)
+        confidence = max(0.50, min(0.95, raw_conf))
 
         # D1: EMA trend adjustment — reward momentum alignment, punish divergence
         conf_after_zscore = confidence  # diagnostic
@@ -167,6 +171,17 @@ class DirectionalSniper(BaseStrategy):
             fused_up = combined_odds / (1 + combined_odds)
             # Convert back to directional confidence, clamp to valid range
             confidence = fused_up if direction == "Up" else (1.0 - fused_up)
+            confidence = max(0.50, min(0.95, confidence))
+
+        # D3: OFI (Order Flow Imbalance) confirmation
+        # Significant OFI signal confirms or opposes CEX direction
+        if abs(self._ofi) > 0.2:
+            if (direction == "Up" and self._ofi > 0) or (direction == "Down" and self._ofi < 0):
+                # OFI confirms direction → boost confidence (max +10%)
+                confidence *= 1.0 + min(abs(self._ofi) * 0.15, 0.10)
+            else:
+                # OFI opposes direction → reduce confidence (max -10%)
+                confidence *= max(0.90, 1.0 - abs(self._ofi) * 0.10)
             confidence = max(0.50, min(0.95, confidence))
 
         # Diagnostic: log pipeline stages (only visible at INFO in commitment window)
