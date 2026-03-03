@@ -25,7 +25,11 @@ Key parameter: MAKER_PRICE
 """
 import logging
 import math
+import os
+import random
+import sqlite3
 import time
+from collections import deque
 from typing import Optional
 
 from scipy.stats import t as t_dist
@@ -94,7 +98,7 @@ class DirectionalSniper(BaseStrategy):
         self._bankroll: float = getattr(config.strategy, 'sniper_bankroll', 100.0)
 
         # v11: Sharpe / drawdown / profit factor tracking
-        self._pnl_history: list[float] = []
+        self._pnl_history: deque = deque(maxlen=500)  # v13 #11: bounded deque
         self._peak_bankroll: float = self._bankroll
         self._max_drawdown: float = 0.0
         self._gross_wins: float = 0.0
@@ -112,6 +116,21 @@ class DirectionalSniper(BaseStrategy):
         # v12: LWBA shadow price (Chainlink settlement replica)
         self._lwba_shadow_price: float = 0.0  # LWBA Mid from multi-exchange depth
         self._lwba_spread_bps: float = 0.0    # LWBA spread in basis points
+        self._lwba_source_count: int = 0       # v13 #3: number of LWBA sources
+
+        # v13 #1: Thompson Sampling — adaptive signal weights
+        # Beta(alpha, beta) prior per signal: d1..d4
+        # Initialized from SQLite if available, else use weak priors
+        self._ts_priors: dict[str, list[float]] = {
+            'd1': [2.0, 2.0],  # EMA trend
+            'd2': [2.0, 2.0],  # CLOB Bayesian
+            'd3': [2.0, 2.0],  # OFI
+            'd4': [2.0, 2.0],  # LWBA spread
+        }
+        self._ts_last_deltas: dict[str, float] = {}  # track which deltas were active
+        # Auto-detect db path: VPS (/opt/data/) vs local (data/)
+        self._ts_db_path = '/opt/data/paper_trades.db' if os.path.isdir('/opt/data') else 'data/paper_trades.db'
+        self._load_thompson_priors()
 
     # --- External setters (called by vps_runner) ---
 
@@ -172,6 +191,64 @@ class DirectionalSniper(BaseStrategy):
         """v12: Set LWBA bid-ask spread in basis points."""
         self._lwba_spread_bps = spread_bps
 
+    def set_lwba_source_count(self, count: int):
+        """v13 #3: Set number of active LWBA sources (0-3)."""
+        self._lwba_source_count = count
+
+    # --- v13 #1: Thompson Sampling helpers ---
+
+    def _load_thompson_priors(self):
+        """Load Beta priors from SQLite if available."""
+        try:
+            conn = sqlite3.connect(self._ts_db_path)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS thompson_priors (
+                    signal TEXT PRIMARY KEY,
+                    alpha REAL NOT NULL,
+                    beta REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            ''')
+            for row in conn.execute('SELECT signal, alpha, beta FROM thompson_priors').fetchall():
+                sig_name, alpha, beta = row
+                if sig_name in self._ts_priors:
+                    self._ts_priors[sig_name] = [max(1.0, alpha), max(1.0, beta)]
+            conn.close()
+        except Exception:
+            pass  # Use default priors
+
+    def _save_thompson_priors(self):
+        """Persist Beta priors to SQLite."""
+        try:
+            conn = sqlite3.connect(self._ts_db_path)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS thompson_priors (
+                    signal TEXT PRIMARY KEY,
+                    alpha REAL NOT NULL,
+                    beta REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            ''')
+            for sig_name, (alpha, beta) in self._ts_priors.items():
+                conn.execute(
+                    'INSERT OR REPLACE INTO thompson_priors (signal, alpha, beta, updated_at) '
+                    'VALUES (?, ?, ?, ?)',
+                    (sig_name, alpha, beta, time.time())
+                )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def _sample_weight(self, signal_name: str) -> float:
+        """Sample a weight multiplier from Beta distribution for this signal.
+        
+        Floor at 0.1 to prevent betavariate(low_alpha, high_beta) from
+        returning ~0.0 which would completely zero-out a signal by chance.
+        """
+        alpha, beta = self._ts_priors.get(signal_name, [2.0, 2.0])
+        return max(0.1, random.betavariate(alpha, beta))
+
     # --- Core logic ---
 
     def _get_direction_confidence(self) -> tuple[str, float]:
@@ -213,10 +290,17 @@ class DirectionalSniper(BaseStrategy):
         # --- v10 FIX #3: Independent fusion in log-odds space ---
         # Each stage computes an *additive delta* in log-odds, preventing
         # sequential dependence and double-counting.
+        # v13 #1: Delta magnitudes are scaled by Thompson Sampling weights
         base_log_odds = _to_log_odds(base_conf)
         d1_delta = 0.0  # EMA trend
         d2_delta = 0.0  # CLOB Bayesian
         d3_delta = 0.0  # OFI
+
+        # v13 #1: Sample adaptive weights for this round
+        w_d1 = self._sample_weight('d1')
+        w_d2 = self._sample_weight('d2')
+        w_d3 = self._sample_weight('d3')
+        w_d4 = self._sample_weight('d4')
 
         # D1: EMA trend adjustment
         # v10 FIX #6: Added trend magnitude threshold (0.1%) to filter noise
@@ -224,42 +308,52 @@ class DirectionalSniper(BaseStrategy):
             trend = (self._ema_fast - self._ema_slow) / self._ema_slow
             if abs(trend) > 0.001:  # only act on > 0.1% trend
                 if (direction == "Up" and trend > 0) or (direction == "Down" and trend < 0):
-                    d1_delta = min(abs(trend) * 200, 0.40)   # max +10% conf equiv
+                    d1_delta = min(abs(trend) * 200, 0.40) * w_d1
                 else:
-                    d1_delta = -min(abs(trend) * 150, 0.40)  # max -10% conf equiv
+                    d1_delta = -min(abs(trend) * 150, 0.40) * w_d1
 
         # D2: CLOB Bayesian fusion
-        # clob_log_odds = ln(p_up/(1-p_up)): positive if CLOB favors Up
-        # For Up direction: positive CLOB LO → confirms → add
-        # For Down direction: positive CLOB LO → contradicts → subtract
         if (0.05 < self._clob_midpoint < 0.45) or (0.55 < self._clob_midpoint < 0.95):
             p_clob = self._clob_midpoint
             clob_log_odds = _to_log_odds(p_clob)
             if direction == "Up":
-                d2_delta = clob_log_odds * 0.5
+                d2_delta = clob_log_odds * 0.5 * w_d2
             else:
-                d2_delta = -clob_log_odds * 0.5
+                d2_delta = -clob_log_odds * 0.5 * w_d2
 
         # D3: OFI confirmation
         if abs(self._ofi) > 0.2:
             if (direction == "Up" and self._ofi > 0) or (direction == "Down" and self._ofi < 0):
-                d3_delta = min(abs(self._ofi) * 0.6, 0.40)   # confirms
+                d3_delta = min(abs(self._ofi) * 0.6, 0.40) * w_d3
             else:
-                d3_delta = -min(abs(self._ofi) * 0.4, 0.40)  # opposes
+                d3_delta = -min(abs(self._ofi) * 0.4, 0.40) * w_d3
 
         # Fuse in log-odds space and convert back
         fused_log_odds = base_log_odds + d1_delta + d2_delta + d3_delta
 
         # v12: LWBA spread confidence modifier
-        # Narrow spread (< 3 bps) → +2% confidence (market is liquid/certain)
-        # Wide spread (> 10 bps) → -5% confidence (market is uncertain)
+        # v13 #3: Also factor in source count
         d4_delta = 0.0
         if self._lwba_spread_bps > 0:
             if self._lwba_spread_bps < 3.0:
-                d4_delta = 0.10   # narrow → bonus
+                d4_delta = 0.10 * w_d4   # narrow → bonus
             elif self._lwba_spread_bps > 10.0:
-                d4_delta = -0.20  # wide → penalty
-            fused_log_odds += d4_delta
+                d4_delta = -0.20 * w_d4  # wide → penalty
+
+        # v13 #3: LWBA source count modifier (also Thompson-weighted for consistency)
+        if self._lwba_source_count == 3:
+            d4_delta += 0.05 * w_d4   # 3/3 sources → extra bonus
+        elif self._lwba_source_count == 2:
+            d4_delta -= 0.10 * w_d4   # 2/3 sources → penalty
+        elif self._lwba_source_count <= 1 and self._lwba_shadow_price > 0:
+            d4_delta -= 0.20 * w_d4   # 1 source only → strong penalty
+
+        fused_log_odds += d4_delta
+
+        # v13 #12: Graceful degradation — log when LWBA unavailable
+        if self._lwba_shadow_price <= 0 and self._cex_price > 0:
+            fused_log_odds -= 0.10  # CEX fallback penalty
+            # (logged once per commitment window, not every cycle)
 
         confidence = _from_log_odds(fused_log_odds)
         confidence = max(0.50, min(0.95, confidence))
@@ -271,6 +365,11 @@ class DirectionalSniper(BaseStrategy):
         self._last_d4 = d4_delta # v12: LWBA spread delta
         self._last_confidence = confidence
         self._last_z_score = base_conf  # store base for diagnostics
+
+        # v13 #1: Track which deltas were active for Thompson update
+        self._ts_last_deltas = {
+            'd1': d1_delta, 'd2': d2_delta, 'd3': d3_delta, 'd4': d4_delta
+        }
 
         return direction, confidence
 
@@ -458,8 +557,10 @@ class DirectionalSniper(BaseStrategy):
             )
             return []
 
-        # Confidence threshold
-        min_confidence = getattr(self.config.strategy, 'sniper_min_confidence', 0.55)
+        # v13 #6: Dynamic confidence threshold based on volatility
+        # Low vol = more aggressive, high vol = more conservative
+        vol_pct = self._volatility * 100  # e.g., 0.01 → 1.0%
+        min_confidence = max(0.55, min(0.85, 0.55 + vol_pct * 0.10))
 
         # D3: Time-decay urgency bonus — later signals are more informative
         # T-10s → +0.00, T-5s → +0.05
@@ -486,6 +587,7 @@ class DirectionalSniper(BaseStrategy):
         # E1: Select outcome based on direction
         outcome = Outcome.UP if direction == "Up" else Outcome.DOWN
 
+        # v13 #2: GTD with expiration at round end (auto-cancel if cancel fails)
         signal = Signal(
             market=market,
             outcome=outcome,
@@ -494,19 +596,20 @@ class DirectionalSniper(BaseStrategy):
             size_usd=order_size,
             confidence=confidence,
             reason=(
-                f"Sniper: {direction} GTC@${maker_price:.2f} × ${order_size:.0f} | "
+                f"Sniper: {direction} GTD@${maker_price:.2f} × ${order_size:.0f} | "
                 f"conf={confidence:.1%} | "
                 f"cex=${self._cex_price:.2f} vs strike=${self._strike_price:.2f} | "
                 f"reversals={self._reversal_count} | T-{t:.0f}s"
             ),
-            order_type="GTC",
+            order_type="GTD",
+            expiration=market.end_time,
         )
 
         self._signal_sent = True
         self._trade_direction = direction  # E1: remember which direction we traded
         corr_str = f" corr_pen={self._correlation_penalty:.1f}" if self._correlation_penalty < 1.0 else ""
         self._logger.info(
-            f"🎯 SIGNAL: {direction} GTC@${maker_price:.2f} × ${order_size:.0f} | "
+            f"🎯 SIGNAL: {direction} GTD@${maker_price:.2f} × ${order_size:.0f} | "
             f"conf={confidence:.1%} | T-{t:.0f}s | "
             f"cex=${self._cex_price:.2f} vs strike=${self._strike_price:.2f}{corr_str}"
         )
@@ -530,6 +633,8 @@ class DirectionalSniper(BaseStrategy):
         self._correlation_penalty = 1.0  # v11: reset per round
         self._lwba_shadow_price = 0.0  # v12: reset LWBA shadow price
         self._lwba_spread_bps = 0.0    # v12: reset spread
+        self._lwba_source_count = 0    # v13: reset source count
+        self._ts_last_deltas = {}      # v13: reset Thompson tracking
         # D1: Do NOT reset EMAs — trend context is valuable across rounds
 
         if market.strike_price > 0:
@@ -594,6 +699,26 @@ class DirectionalSniper(BaseStrategy):
                 self._peak_bankroll = self._bankroll
             dd = (self._peak_bankroll - self._bankroll) / self._peak_bankroll if self._peak_bankroll > 0 else 0
             self._max_drawdown = max(self._max_drawdown, dd)
+
+        # v13 #1: Update Thompson Sampling priors
+        # For each signal that contributed a non-zero delta,
+        # reward if direction matched settlement, penalize if not
+        if self._shares_bought > 0 and self._trade_direction and settled_outcome:
+            direction_correct = (self._trade_direction == settled_outcome)
+            for sig_name, delta_val in self._ts_last_deltas.items():
+                if abs(delta_val) > 0.01:  # signal was active
+                    alpha, beta = self._ts_priors[sig_name]
+                    # Did this signal help or hurt?
+                    signal_agreed = (delta_val > 0)  # positive delta = confirmed direction
+                    if (signal_agreed and direction_correct) or (not signal_agreed and not direction_correct):
+                        # Signal was right
+                        self._ts_priors[sig_name] = [alpha + 1.0, beta]
+                    else:
+                        # Signal was wrong
+                        self._ts_priors[sig_name] = [alpha, beta + 1.0]
+            # Persist every 10 rounds
+            if self.state.rounds_traded % 10 == 0:
+                self._save_thompson_priors()
 
         if self._shares_bought > 0:
             # v11 #10: Compute running Sharpe (annualized per-round)

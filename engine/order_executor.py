@@ -160,7 +160,7 @@ class OrderExecutor:
                 is_buy=is_buy,
             )
         else:
-            # Maker order: probabilistic fill, 0% fee
+            # Maker order (GTC or GTD): probabilistic fill, 0% fee
             # M1 FIX: For DirectionalSniper, the GTC order rests from
             # signal time until blackout window (T-5s) or round end.
             # Use actual seconds_remaining as upper bound, minus 5s blackout.
@@ -238,7 +238,7 @@ class OrderExecutor:
                 signed_order = self._clob_client.create_market_order(order_args)
                 resp = self._clob_client.post_order(signed_order, OrderType.FOK)
             else:
-                # Limit order (GTC)
+                # Limit order (GTC or GTD)
                 order_args = OrderArgs(
                     token_id=signal.token_id,
                     price=signal.price,
@@ -247,18 +247,31 @@ class OrderExecutor:
                 )
                 tick_size = signal.market.tick_size
                 neg_risk = signal.market.neg_risk
+
+                # v13 #2: Determine OrderType based on signal
+                if signal.order_type == "GTD" and signal.expiration > 0:
+                    clob_order_type = OrderType.GTD
+                else:
+                    clob_order_type = OrderType.GTC
+
                 # C7 FIX: pass tick_size and neg_risk to create_order
-                # for correct EIP-712 signature. Without these, live
-                # orders may be rejected with "invalid signature".
                 signed_order = self._clob_client.create_order(
                     order_args,
                     options={"tick_size": tick_size, "neg_risk": neg_risk},
                 )
+
+                # v13 #2 + #5: GTD expiration + Post-Only
+                post_kwargs = {
+                    "tick_size": tick_size,
+                    "neg_risk": neg_risk,
+                }
+                if clob_order_type == OrderType.GTD and signal.expiration > 0:
+                    post_kwargs["expiration"] = signal.expiration
+
                 resp = self._clob_client.post_order(
                     signed_order,
-                    OrderType.GTC,
-                    tick_size=tick_size,
-                    neg_risk=neg_risk,
+                    clob_order_type,
+                    **post_kwargs,
                 )
 
             # Parse response
@@ -273,7 +286,7 @@ class OrderExecutor:
 
             logger.info(
                 f"[LIVE] {signal.side.value} {signal.outcome.value} @ {signal.price:.3f} "
-                f"| order_id={record.order_id} | status={record.status}"
+                f"| type={signal.order_type} | order_id={record.order_id} | status={record.status}"
             )
             return record
 

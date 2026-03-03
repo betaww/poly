@@ -85,8 +85,10 @@ def print_report(stats: dict):
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Paper Trading Report")
     parser.add_argument("--days", type=int, default=7, help="Report period (days)")
-    # Auto-detect db path: VPS (/opt/polymarket/data) or local (data/)
-    default_db = "/opt/polymarket/data/paper_trades.db"
+    # Auto-detect db path: VPS (/opt/data/) or older (/opt/polymarket/data/) or local (data/)
+    default_db = "/opt/data/paper_trades.db"
+    if not os.path.exists(default_db):
+        default_db = "/opt/polymarket/data/paper_trades.db"
     if not os.path.exists(default_db):
         default_db = "data/paper_trades.db"
     parser.add_argument("--db", default=default_db,

@@ -231,9 +231,11 @@ class VPSRunner:
             strat.set_clob_midpoint(book_up.midpoint)
 
         # D3: Pass Binance OFI signal to sniper
+        # v13 #8: Multi-exchange OFI — currently uses Binance as primary source.
+        # TODO: Compute OFI from OKX/Coinbase depth streams when available.
         if hasattr(strat, 'set_ofi'):
-            ofi = self._depth_feed.get_ofi(market.asset)
-            strat.set_ofi(ofi)
+            ofi_binance = self._depth_feed.get_ofi(market.asset)
+            strat.set_ofi(ofi_binance)
 
         # v12: LWBA shadow price — replicate Chainlink settlement price
         books = self._multi_depth.get_all_books(market.asset)
@@ -244,6 +246,9 @@ class VPSRunner:
                     strat.set_lwba_shadow_price(lwba.mid)
                 if hasattr(strat, 'set_lwba_spread'):
                     strat.set_lwba_spread(lwba.spread_bps)
+                # v13 #3: Pass source count to strategy
+                if hasattr(strat, 'set_lwba_source_count'):
+                    strat.set_lwba_source_count(lwba.n_sources)
                 # Log LWBA periodically (every ~10s for each asset)
                 if market.seconds_remaining % 10 < 2:
                     mids_str = " ".join(
@@ -254,6 +259,13 @@ class VPSRunner:
                         f"bid=${lwba.bid:,.2f} ask=${lwba.ask:,.2f} "
                         f"spread={lwba.spread_bps:.1f}bps "
                         f"sources={lwba.n_sources} | {mids_str}"
+                    )
+            else:
+                # v13 #12: Log LWBA degradation
+                if market.seconds_remaining % 30 < 2:
+                    logger.warning(
+                        f"⚠️ LWBA {market.asset.upper()} degraded — "
+                        f"using CEX fallback (accuracy -0.6%)"
                     )
 
     async def _vps_fallback_cex_price(self, asset: str) -> float:
@@ -418,6 +430,23 @@ class VPSRunner:
         # v11 #15: Reset cross-asset correlation tracking each scan cycle
         self._slot_signals_this_cycle = {}
 
+        # v13 #10: Brain offline alerting (after 5 minutes)
+        if not self._redis.is_connected:
+            if self._brain_offline_since == 0:
+                self._brain_offline_since = now
+            elif now - self._brain_offline_since > 300:  # 5 minutes
+                # Throttle: only log every 10 minutes
+                next_alert = getattr(self, '_brain_next_alert', 0)
+                if now >= next_alert:
+                    offline_min = (now - self._brain_offline_since) / 60
+                    logger.warning(
+                        f"[ALERT] Brain offline for {offline_min:.0f} min -- "
+                        f"running on VPS CEX fallback only"
+                    )
+                    self._brain_next_alert = now + 600  # next alert in 10 min
+        else:
+            self._brain_offline_since = 0
+
         # M6 FIX: Dispatch each market to asset-specific slots only.
         # Each slot is bound to one asset, preventing round-thrashing.
         for slot in self._slots:
@@ -449,24 +478,38 @@ class VPSRunner:
             # "Up if price at END ≥ price at START". There is NO fixed strike
             # in the question text. We use CEX price at round start as strike.
             if market.strike_price <= 0:
-                pred = self._redis.get_prediction(market.asset)
-                if pred and pred.cex_price > 0:
-                    market.strike_price = pred.cex_price
-                    slot._strike_set_at = time.time()  # v10 FIX #2
-                    logger.info(
-                        f"Dynamic strike set: {market.asset.upper()} "
-                        f"${market.strike_price:,.2f} (CEX at round start)"
-                    )
-                else:
-                    # Fallback: use strategy's cached CEX price
-                    strat = slot.strategy
-                    if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
-                        market.strike_price = strat._cex_price
-                        slot._strike_set_at = time.time()  # v10 FIX #2
+                # v13 #7: Prefer LWBA shadow price as strike source (matches Chainlink)
+                lwba_books = self._multi_depth.get_all_books(market.asset)
+                if lwba_books:
+                    lwba_result = self._lwba.aggregate(lwba_books, asset=market.asset)
+                    if lwba_result.is_valid and lwba_result.n_sources >= 3:
+                        market.strike_price = lwba_result.mid
+                        slot._strike_set_at = time.time()
                         logger.info(
-                            f"Dynamic strike set (fallback): {market.asset.upper()} "
+                            f"Dynamic strike set (LWBA 3-source): {market.asset.upper()} "
                             f"${market.strike_price:,.2f}"
                         )
+
+                # Fallback: Brain CEX prediction
+                if market.strike_price <= 0:
+                    pred = self._redis.get_prediction(market.asset)
+                    if pred and pred.cex_price > 0:
+                        market.strike_price = pred.cex_price
+                        slot._strike_set_at = time.time()
+                        logger.info(
+                            f"Dynamic strike set (CEX): {market.asset.upper()} "
+                            f"${market.strike_price:,.2f} (CEX at round start)"
+                        )
+                    else:
+                        # Fallback: use strategy's cached CEX price
+                        strat = slot.strategy
+                        if hasattr(strat, '_cex_price') and strat._cex_price and strat._cex_price > 0:
+                            market.strike_price = strat._cex_price
+                            slot._strike_set_at = time.time()
+                            logger.info(
+                                f"Dynamic strike set (fallback): {market.asset.upper()} "
+                                f"${market.strike_price:,.2f}"
+                            )
 
             await slot.strategy.on_round_start(market)
 

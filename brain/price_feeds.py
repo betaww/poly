@@ -535,9 +535,22 @@ class SyntheticOracle:
                 sum_hl_sq += math.log(hl_ratio) ** 2
 
         parkinson_var = sum_hl_sq / (4.0 * n * math.log(2))
-        vol = max(0.001, parkinson_var ** 0.5)
+        parkinson_vol = max(0.001, parkinson_var ** 0.5)
 
-        return vol
+        # v13 #4: Close-to-close Realized Volatility complement
+        # Parkinson underestimates vol in trending markets (tight H/L during drift)
+        # BUG FIX: Sort by bar_id (time), not open price — close-to-close must be chronological
+        sorted_bar_ids = sorted(bars.keys())
+        closes = [bars[bid]['c'] for bid in sorted_bar_ids]
+        if len(closes) >= 3:
+            returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes)) if closes[i-1] > 0]
+            if len(returns) >= 2:
+                mean_ret = sum(returns) / len(returns)
+                realized_var = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
+                realized_vol = max(0.001, realized_var ** 0.5)
+                return max(parkinson_vol, realized_vol)
+
+        return parkinson_vol
 
     def get_direction(self, strike_price: float) -> tuple[str, float]:
         """C2 FIX: Predict settlement direction relative to strike.

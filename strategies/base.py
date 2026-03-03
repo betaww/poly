@@ -34,6 +34,7 @@ class Signal:
     confidence: float = 0.5        # 0.0 - 1.0 confidence score
     reason: str = ""               # human-readable rationale
     order_type: str = "GTC"        # GTC, FOK, GTD
+    expiration: int = 0            # v13: GTD expiration unix timestamp
 
     @property
     def token_id(self) -> str:
@@ -43,7 +44,7 @@ class Signal:
 
     @property
     def is_maker(self) -> bool:
-        return self.order_type == "GTC"
+        return self.order_type in ("GTC", "GTD")  # v13: GTD is also maker
 
 
 @dataclass
